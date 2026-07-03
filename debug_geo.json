@@ -1,0 +1,30 @@
+[
+  {
+    "label": "direct-bet365",
+    "url": "https://www.bet365.com/#/AC/B1/C1/D8/E197033650/F3/I17/P33588/H1/",
+    "proxy": "no proxy",
+    "title": "Parier chez bet365 - Bookmaker en ligne et en direct - Derniers paris et cotes",
+    "final_url": "https://www.bet365.com/#/AC/B1/C1/D8/E197033650/F3/I17/P33588/H1/",
+    "http_data_count": 1,
+    "ws_data_count": 0,
+    "http_data": [
+      {
+        "url": "https://www.bet365.com/footerapi/sitecontent?lid=4&zid=0&pd=%23FO%23&cid=130&cgid=1&ctid=130",
+        "length": 8556,
+        "preview": "F|EV;IT=#FO#;ET=10;|MG;SY=fmb;NA=Retards de transmission et informations;N2=Bien que nous fassions tout pour assurer l'exactitude des informations relatives aux évènements affichées sur notre site, celles-ci ne doivent être utilisées qu'à titre indicatif. Nous n'assumons aucune responsabilité en cas"
+      }
+    ],
+    "ws_data": []
+  },
+  {
+    "label": "proxy-bet365",
+    "url": "https://www.bet365.com/#/AC/B1/C1/D8/E197033650/F3/I17/P33588/H1/",
+    "proxy": "with proxy",
+    "title": "bet365 US - where do you want to play?",
+    "final_url": "https://www.bet365.com/usa?isoCode=US&gcsid=FL",
+    "http_data_count": 0,
+    "ws_data_count": 0,
+    "http_data": [],
+    "ws_data": []
+  }
+]
