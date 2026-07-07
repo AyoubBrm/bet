@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: sofa_postgres
+    environment:
+      POSTGRES_USER: sofa_user
+      POSTGRES_PASSWORD: sofa_password
+      POSTGRES_DB: sofa_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: sofa_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: always
+
+  api:
+    build: .
+    container_name: sofa_api
+    ports:
+      - "8002:8002"
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://sofa_user:sofa_password@postgres/sofa_db
+      - REDIS_HOST=redis
+    restart: always
+
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sofa_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    restart: always
+
+  adminer:
+    image: adminer
+    container_name: sofa_adminer
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+  redis_data:

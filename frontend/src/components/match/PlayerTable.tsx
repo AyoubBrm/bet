@@ -1,0 +1,133 @@
+import { useMemo } from "react";
+import type { Player, SofascoreResponse } from "../../types/api";
+import { PlayerRow } from "./PlayerRow";
+import { isPlayerMatch } from "../../lib/string-matching";
+import { calculateEdgeData } from "../../lib/math";
+
+// Odds range considered "close to 2.0"
+const ODDS_MIN = 1.65;
+const ODDS_MAX = 2.50;
+
+interface PlayerTableProps {
+  players: Player[];
+  sofascoreData: SofascoreResponse | null;
+  marketType: 'shots' | 'tackles';
+  aliasVersion: number;
+}
+
+/** Returns the line (e.g. "Shot 1+") with odds closest to 2.0 */
+function getBestLine(player: Player): { line: string; odds: number } | null {
+  let best: { line: string; odds: number } | null = null;
+  let bestDist = Infinity;
+  for (const [line, oddsVal] of Object.entries(player.odds)) {
+    const num = Number(oddsVal);
+    const dist = Math.abs(num - 2.0);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = { line, odds: num };
+    }
+  }
+  return best;
+}
+
+/** Looks up the sofascore stats for a player */
+function getSofaStats(
+  player: Player,
+  sofascoreData: SofascoreResponse | null
+) {
+  if (!sofascoreData) return null;
+  for (const match of sofascoreData.matches) {
+    for (const p of match.players) {
+      if (isPlayerMatch(player.player, p.name)) {
+        if (p.matchs && p.matchs.length > 0 && p.matchs[0].statistics) {
+          return p.matchs[0].statistics;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function PlayerTable({ players, sofascoreData, marketType, aliasVersion }: PlayerTableProps) {
+  // Filter to odds near 2.0, compute EV for each player, then sort by EV descending
+  const enrichedPlayers = useMemo(() => {
+    return players
+      .map((player) => {
+        const best = getBestLine(player);
+        // Only keep players whose best line is "close to 2.0"
+        if (!best || best.odds < ODDS_MIN || best.odds > ODDS_MAX) return null;
+
+        const sofaStats = getSofaStats(player, sofascoreData);
+        const lambda =
+          marketType === 'shots'
+            ? sofaStats?.shots_per_90_minutes
+            : sofaStats?.tackles_per_90_minutes;
+
+        const edgeData = calculateEdgeData(best.line, best.odds, lambda);
+        const ev = edgeData?.evAtBookOdds ?? -Infinity;
+
+        return { player, bestLine: best.line, ev };
+      })
+      .filter((x): x is { player: Player; bestLine: string; ev: number } => x !== null)
+      .sort((a, b) => b.ev - a.ev); // highest EV first
+  }, [players, sofascoreData, marketType, aliasVersion]);
+
+  if (enrichedPlayers.length === 0) {
+    return (
+      <div className="p-8 text-center text-text-muted text-sm">
+        No players found with odds between {ODDS_MIN} – {ODDS_MAX} for this match.
+      </div>
+    );
+  }
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="min-w-full divide-y divide-border">
+        <thead className="bg-surface/50">
+          <tr>
+            <th scope="col" className="py-3 px-6 text-left text-xs font-medium text-text-muted uppercase tracking-wider">
+              Player
+            </th>
+            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+              Line ▼
+            </th>
+            {marketType === 'shots' && (
+              <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+                Shots/90
+              </th>
+            )}
+            {marketType === 'tackles' && (
+              <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+                Tackles/90
+              </th>
+            )}
+            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+              Bet365 Odds
+            </th>
+            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+              My Probability
+            </th>
+            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+              EV ↓
+            </th>
+            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+              True Edge
+            </th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border/50 bg-background/30 backdrop-blur-sm">
+          {enrichedPlayers.map(({ player, bestLine }, idx) => (
+            <PlayerRow
+              key={`${player.player}-${idx}`}
+              player={player}
+              sofascoreData={sofascoreData}
+              marketType={marketType}
+              aliasVersion={aliasVersion}
+              defaultLine={bestLine}
+            />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}

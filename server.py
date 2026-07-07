@@ -24,6 +24,7 @@ from urllib.parse import quote, unquote
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
 
@@ -40,8 +41,8 @@ logger = logging.getLogger("bet365_scraper")
 
 PW_PROXY = {
     "server": "http://res.geonix.com:10000",
-    "username": "19d5d5ecee19c4e2",
-    "password": "MUSRJBNjWVZAmzfd",
+    "username": "9614f20deabaca1c",
+    "password": "2FUfRGWAl6Sq4CMu",
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -125,8 +126,17 @@ class Bet365Browser:
 
     async def _create_context(self, browser):
         """Create a new browser context with stealth settings."""
-        # Try without proxy first (since the provided proxy is US-based and redirects to /usa)
-        for proxy_config in [None, PW_PROXY]:
+        # Get storage state from the default context (where the user's cookies are)
+        storage_state = None
+        if len(browser.contexts) > 0:
+            try:
+                storage_state = await browser.contexts[0].storage_state()
+                logger.info("Successfully extracted session and cookies from default browser context.")
+            except Exception as e:
+                logger.warning(f"Could not extract storage state: {e}")
+
+        # Force using the provided proxy because the local IP is blocked
+        for proxy_config in [PW_PROXY]:
             proxy_label = "with proxy" if proxy_config else "without proxy"
             try:
                 kwargs = {
@@ -139,6 +149,9 @@ class Bet365Browser:
                 }
                 if proxy_config:
                     kwargs["proxy"] = proxy_config
+                
+                if storage_state:
+                    kwargs["storage_state"] = storage_state
 
                 context = await browser.new_context(**kwargs)
                 await context.add_init_script(STEALTH_SCRIPT)
@@ -280,6 +293,58 @@ class Bet365Browser:
                     try:
                         body = await response.text()
                         if body and ("|PA;" in body or "|CO;" in body) and "footerapi" not in url:
+                            # Wait for match blocks to load
+                            await page.wait_for_selector('.rrc-02', timeout=20000)
+                            await asyncio.sleep(2) # Give it time to fully render the list
+                            
+                            # Scroll a bit to load lazy elements
+                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+                            await asyncio.sleep(1)
+                            
+                            # Get the HTML and parse
+                            html = await page.content()
+                            soup = BeautifulSoup(html, 'html.parser')
+                            
+                            # Matches in Player Shots on Target usually use rrc-02 container
+                            matches = []
+                            events = soup.find_all('div', class_=lambda c: c and ('rrc-02' in c or 'rrc-55' in c))
+                            
+                            for event in events:
+                                try:
+                                    # Extract from Player Shots style block (rrc-02)
+                                    header_el = event.find('div', class_=lambda c: c and 'rrc-55d' in c)
+                                    date_el = event.find('span', class_=lambda c: c and 'rrc-9a6' in c)
+                                    
+                                    if header_el:
+                                        teams = header_el.text.strip().split(' v ')
+                                        if len(teams) == 2:
+                                            home_team, away_team = teams
+                                        else:
+                                            home_team = header_el.text.strip()
+                                            away_team = ""
+                                            
+                                        date_str, time_str = "", ""
+                                        if date_el:
+                                            full_date = date_el.text.strip()
+                                            # e.g., 'Fri 3 Jul 18:00'
+                                            parts = full_date.rsplit(' ', 1)
+                                            if len(parts) == 2:
+                                                date_str, time_str = parts
+                                            else:
+                                                date_str = full_date
+
+                                        matches.append({
+                                            "date": date_str,
+                                            "time": time_str,
+                                            "home_team": home_team,
+                                            "away_team": away_team,
+                                            "link": ""
+                                        })
+                                        continue
+                                except Exception as e:
+                                    logger.error(f"Error parsing event: {e}")
+                                    
+                            logger.info(f"DOM scraped {len(matches)} matches from Player Shots page")
                             logger.info(f"📦 Captured HTTP API response: {url[:100]}... (length={len(body)})")
                             captured_responses.append(body)
                     except Exception:
@@ -372,6 +437,7 @@ class Bet365Browser:
                     ]
                 )
 
+            page = None
             try:
                 if browser.contexts:
                     context = browser.contexts[0]
@@ -379,6 +445,15 @@ class Bet365Browser:
                     context, _ = await self._create_context(browser)
 
                 page = await context.new_page()
+                
+                # Cleanup: close all other tabs in this context to prevent accumulation
+                for p in context.pages:
+                    if p != page:
+                        try:
+                            await p.close()
+                        except Exception:
+                            pass
+                            
                 await page.goto(full_url, wait_until="load", timeout=60000)
 
                 # Expand the target market header and click "Show more"
@@ -542,7 +617,7 @@ class Bet365Browser:
                     if m.lower() == market_title.lower():
                         return idx
                 return 999
-                
+
             all_markets.sort(key=lambda x: get_market_index(x["market"]))
 
             return all_markets
@@ -641,6 +716,199 @@ class Bet365Browser:
 
         return players_list
 
+    async def fetch_upcoming_player_shots(self, url: str, wait_seconds: int = 5) -> list:
+        """
+        Navigates to the upcoming matches page and extracts match data directly from the DOM.
+        """
+        from playwright.async_api import async_playwright
+
+        logger.info(f"Navigating to upcoming matches: {url}")
+
+        async with async_playwright() as p:
+            try:
+                logger.info("Attempting to connect to real Chrome via CDP on port 9222...")
+                browser = await p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                logger.info("✅ Successfully connected to your real Chrome browser!")
+            except Exception as e:
+                logger.warning(f"Could not connect to CDP: {e}. Fallback to launching new browser.")
+                browser = await p.chromium.launch(
+                    headless=False,
+                    channel="chrome",
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+                )
+
+            if browser.contexts:
+                context = browser.contexts[0]
+            else:
+                context, _ = await self._create_context(browser)
+            page = None
+            try:
+                page = await context.new_page()
+                
+                # Cleanup: close all other tabs in this context to prevent accumulation
+                for p in context.pages:
+                    if p != page:
+                        try:
+                            await p.close()
+                        except Exception:
+                            pass
+                            
+                await page.goto(url, wait_until="load", timeout=60000)
+                await asyncio.sleep(wait_seconds)
+
+            except Exception as e:
+                logger.warning(f"Timeout or error navigating: {e}")
+
+            # Extract the coupon data on the final page
+            js_code = """() => {
+                const matches = [];
+                // Search for blocks that look like the Player Shots layout (rrc-02)
+                const matchEls = document.querySelectorAll('.rrc-02');
+
+                for (const matchEl of matchEls) {
+                    const headerEl = matchEl.querySelector('.rrc-55d');
+                    const dateEl = matchEl.querySelector('.rrc-9a6');
+
+                    if (headerEl) {
+                        const headerText = headerEl.textContent.trim();
+                        const teams = headerText.split(' v ');
+                        const home_team = teams.length === 2 ? teams[0] : headerText;
+                        const away_team = teams.length === 2 ? teams[1] : '';
+
+                        let date_str = '';
+                        let time_str = '';
+                        if (dateEl) {
+                            const full_date = dateEl.textContent.trim();
+                            const parts = full_date.split(' ');
+                            if (parts.length > 1) {
+                                time_str = parts.pop();
+                                date_str = parts.join(' ');
+                            } else {
+                                date_str = full_date;
+                            }
+                        }
+
+                        let link = '';
+                        const linkEl = matchEl.querySelector('a[href]');
+                        if (linkEl) {
+                            link = linkEl.getAttribute('href');
+                        } else {
+                            try {
+                                const key = Object.keys(matchEl).find(k => k.startsWith('__reactFiber$'));
+                                if (key) {
+                                    let curr = matchEl[key];
+                                    let depth = 0;
+                                    let foundFixtureId = null;
+                                    const searchObj = (obj, d = 0) => {
+                                        if (d > 5 || !obj || typeof obj !== 'object') return null;
+                                        for (const k in obj) {
+                                            try {
+                                                const val = obj[k];
+                                                if (typeof val === 'string' && val.length >= 8 && /^\\d+$/.test(val)) return val;
+                                                if (typeof val === 'object') {
+                                                    const res = searchObj(val, d + 1);
+                                                    if (res) return res;
+                                                }
+                                            } catch (e) {}
+                                        }
+                                        return null;
+                                    };
+                                    while (curr && depth < 20) {
+                                        if (curr.memoizedProps) {
+                                            if (curr.memoizedProps.fixtureId) foundFixtureId = curr.memoizedProps.fixtureId;
+                                            if (curr.memoizedProps.fixture && curr.memoizedProps.fixture.id) foundFixtureId = curr.memoizedProps.fixture.id;
+                                            if (!foundFixtureId) foundFixtureId = searchObj(curr.memoizedProps);
+                                        }
+                                        if (foundFixtureId) {
+                                            const cleanId = foundFixtureId.endsWith('0') ? foundFixtureId.slice(0, -1) : foundFixtureId;
+                                            link = `https://www.bet365.com/#/AC/B1/C1/D8/E${cleanId}/F3/`;
+                                            break;
+                                        }
+                                        curr = curr.return;
+                                        depth++;
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+
+                        matches.push({
+                            date: date_str,
+                            time: time_str,
+                            home_team: home_team,
+                            away_team: away_team,
+                            link: link
+                        });
+                    }
+                }
+
+                // Fallback generic participant market extraction if no matches found
+                if (matches.length === 0) {
+                    const fallbackEls = document.querySelectorAll('.umr-70');
+                    for (const event of fallbackEls) {
+                        const dateHeader = event.querySelector('header');
+                        const date = dateHeader ? dateHeader.textContent.trim() : "Unknown Date";
+
+                        const timeDiv = event.querySelector('.umr-74');
+                        const time = timeDiv ? timeDiv.textContent.trim() : "Unknown Time";
+
+                        const teams = Array.from(event.querySelectorAll('.umr-71c'));
+                        const home_team = teams.length > 0 ? teams[0].textContent.trim() : "Unknown Home Team";
+                        const away_team = teams.length > 1 ? teams[1].textContent.trim() : "Unknown Away Team";
+
+                        matches.push({
+                            date: date,
+                            time: time,
+                            home_team: home_team,
+                            away_team: away_team,
+                            link: ""
+                        });
+                    }
+                }
+
+                if (matches.length === 0) {
+                    const bodyHtml = document.body ? document.body.innerHTML : "No body";
+                    return [{ error: "No matches found.", html: bodyHtml }];
+                }
+
+                // Backfill empty dates from previous matches
+                let lastDate = 'Unknown Date';
+                for (const m of matches) {
+                    if (m.date) {
+                        lastDate = m.date;
+                    } else {
+                        m.date = lastDate;
+                    }
+                }
+
+                // Format the JSON exactly as requested by user in their original prompt
+                const finalMatches = [];
+                for (const m of matches) {
+                    if (m.error) return matches;
+                    finalMatches.push({
+                        date: m.date,
+                        time: m.time,
+                        home_team: m.home_team,
+                        away_team: m.away_team,
+                        odds: m.odds,
+                        link: m.link
+                    });
+                }
+                return finalMatches;
+            }"""
+        
+            try:
+                html_dump = await page.evaluate("() => document.body.innerHTML")
+                with open("C:/Users/bmayo/OneDrive/Desktop/SOFA/debug_player_shots.html", "w", encoding="utf-8") as f:
+                    f.write(html_dump)
+                logger.info("Saved HTML to debug_player_shots.html")
+            
+                matches = await page.evaluate(js_code)
+                logger.info(f"DOM scraped {len(matches)} upcoming matches")
+            
+                return matches
+            
+            finally:
+                await browser.close()
 
 # Global browser instance
 bet365 = Bet365Browser()
@@ -650,10 +918,56 @@ bet365 = Bet365Browser()
 # FastAPI App
 # ─────────────────────────────────────────────────────────────────────
 
+from contextlib import asynccontextmanager
+import asyncio
+import json
+from app.services.monitor import monitor_loop
+from app.database import engine, Base
+import redis
+
+monitor_task = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global monitor_task
+    # Create tables safely with retry for docker
+    max_retries = 5
+    for i in range(max_retries):
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            break
+        except Exception as e:
+            if i == max_retries - 1:
+                raise e
+            logger.warning(f"Database not ready yet, retrying in 3 seconds... ({e})")
+            await asyncio.sleep(3)
+        
+    # Start the odds monitoring loop
+    monitor_task = asyncio.create_task(monitor_loop())
+    yield
+    
+    # Clean up on shutdown
+    if monitor_task:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Bet365 Player Stats Scraper",
     description="Fetches player tackles & shots from Bet365 using a real browser.",
     version="4.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust in production
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -811,129 +1125,365 @@ def merge_captured_data(responses: list[str], stat_type: str) -> dict:
 # API Endpoints
 # ─────────────────────────────────────────────────────────────────────
 
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "Bet365 Player Stats Scraper v4",
-        "description": "Uses a real browser + DOM scraping to extract player stats.",
-        "endpoints": {
-            "/stats/tackles?fixture_id=XXX": "Player tackles",
-            "/stats/shots?fixture_id=XXX": "Player shots",
-            "/stats/page?url=FULL_URL": "Navigate to any bet365 URL and extract stats",
-        }
-    }
-
-
-@app.get("/stats/tackles")
-async def get_tackles(
-    fixture_id: str = Query(
-        default="197033650",
-        description="Bet365 fixture/event ID (e.g. 197033650, not E197033650)",
-    ),
-):
-    """Fetch player tackles statistics."""
-    fid = clean_fixture_id(fixture_id)
-    hash_path = f"#/AC/B1/C1/D8/E{fid}/F3/I17/P33891/H1/"
-    try:
-        players = await bet365.fetch_page_with_hash(hash_path, stat_name="tackles")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Browser fetch failed: {str(e)}")
-    return {"number of player": len(players), "players": players}
-
-
-@app.get("/stats/shots")
-async def get_shots(
-    fixture_id: str = Query(
-        default="197033650",
-        description="Bet365 fixture/event ID (e.g. 197033650, not E197033650)",
-    ),
-):
+@app.get("/upcoming/matches")
+def get_upcoming_matches():
     """
-    Fetch player shots statistics grouped by market:
-      - Player Shots on Target
-      - Player Headed Shots on Target
-      - Player Shots on Target Outside Box
+    Fetch upcoming football matches from Odds-API
     """
-    fid = clean_fixture_id(fixture_id)
-    # Correct URL: D8 (not D7) and I15 (not I17) — matches the live bet365 shots page
-    hash_path = f"#/AC/B1/C1/D8/E{fid}/F3/I15/"
-    exact_markets = [
-        "Player Shots on Target",
-        "Player Headed Shots on Target",
-        "Player Shots on Target Outside Box",
-        "Player Shots",
-    ]
+    import requests
+    
+    api_key = "164f27b032add66aa5dd77ae0f252443eae8b9136493a57b39f6385937771b0f"
     try:
-        markets = await bet365.fetch_page_with_hash(
-            hash_path,
-            stat_name="shots",
-            exact_markets=exact_markets,
+        response = requests.get(
+            'https://api.odds-api.io/v3/events?sport=football&apiKey=164f27b032add66aa5dd77ae0f252443eae8b9136493a57b39f6385937771b0f'
         )
+        response.raise_for_status()
+        data = response.json()
+        
+        # Determine if the response is a direct list or nested inside a key like 'data'
+        events = data if isinstance(data, list) else data.get("data", [])
+        
+        import re
+        filtered_events = []
+        for event in events:
+            if isinstance(event, dict):
+                league = event.get("league", {})
+                status = event.get("status")
+                
+                if league.get("slug") == "international-fifa-world-cup" and status == "pending":
+                    home_team = str(event.get("home", ""))
+                    away_team = str(event.get("away", ""))
+                    
+                    # Exclude placeholders like "W99", "L100", "RU101", or "TBC"
+                    is_placeholder = (
+                        re.match(r"^(?:W|L|RU)\d+$", home_team) or 
+                        re.match(r"^(?:W|L|RU)\d+$", away_team) or 
+                        "TBC" in home_team or 
+                        "TBC" in away_team
+                    )
+                    
+                    if not is_placeholder:
+                        filtered_events.append(event)
+                    
+        return {
+            "num_of_matches": len(filtered_events),
+            "matches": filtered_events
+        }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Browser fetch failed: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"API fetch failed: {str(e)}")
+
+
+@app.get("/upcoming/odds")
+def get_upcoming_odds():
+    """
+    Fetch upcoming football matches, then iterate through their IDs to fetch Bet365 odds.
+    """
+    import requests
+    
+    api_key = "164f27b032add66aa5dd77ae0f252443eae8b9136493a57b39f6385937771b0f"
+    
+    # 1. Reuse existing logic to get the filtered matches
+    try:
+        upcoming_data = get_upcoming_matches()
+        matches = upcoming_data.get("matches", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch base matches: {str(e)}")
+        
+    # 2. Loop through each match ID and fetch odds
+    results = []
+    for match in matches:
+        event_id = match.get("id")
+        if not event_id:
+            continue
+            
+        try:
+            odds_response = requests.get(
+                'https://api.odds-api.io/v3/odds',
+                params={
+                    'apiKey': api_key,
+                    'eventId': event_id,
+                    'bookmakers': 'Bet365'
+                },
+                timeout=10
+            )
+            
+            odds_data = None
+            if odds_response.ok:
+                raw_odds = odds_response.json()
+                
+                # Filter to only "Player Shots" and "Player Tackles"
+                bookmakers = raw_odds.get('bookmakers', {})
+                bet365_markets = bookmakers.get('Bet365', [])
+                
+                filtered_markets = [
+                    m for m in bet365_markets
+                    if m.get('name') in ["Player Shots", "Player Tackles"]
+                ]
+                
+                # Assign back the filtered markets
+                if 'Bet365' in bookmakers:
+                    raw_odds['bookmakers']['Bet365'] = filtered_markets
+                    
+                odds_data = raw_odds
+            else:
+                logger.warning(f"Failed to fetch odds for event {event_id}: HTTP {odds_response.status_code}")
+                
+            results.append({
+                "match": match,
+                "odds": odds_data
+            })
+        except Exception as e:
+            logger.warning(f"Failed to fetch odds for event {event_id}: {str(e)}")
+            results.append({
+                "match": match,
+                "odds": None
+            })
+            
     return {
-        "number of markets": len(markets),
-        "markets": markets,
+        "num_of_matches": len(results),
+        "matches_with_odds": results
     }
 
 
-@app.get("/stats/page")
-async def get_from_url(
-    url: str = Query(
-        ...,
-        description="Full bet365 URL, e.g. https://www.bet365.com/#/AC/B1/C1/D8/E197033650/F3/I17/P33588/H1/",
-    ),
-    stat_name: str = Query(default="tackles", description="Stat type name"),
-    wait: int = Query(default=10, description="Seconds to wait for data to load"),
-):
+def parse_player_shots_market(market: dict):
     """
-    Navigate to any bet365 URL and extract player stats via DOM scraping.
+    Process ONLY the "Player Shots" market payload.
+    Groups entries by player name, converts hdp to shot lines, and extracts the over odds.
     """
-    if "#" in url:
-        hash_path = "#" + url.split("#", 1)[1]
-    else:
-        hash_path = url
+    import re
+    
+    if not market or market.get("name") != "Player Shots":
+        return []
+        
+    players = {}
+    
+    for entry in market.get("odds", []):
+        label = entry.get("label", "")
+        hdp = entry.get("hdp")
+        over_val = entry.get("over")
+        
+        if not label or hdp is None or over_val is None:
+            continue
+            
+        # Remove the team identifier in parentheses
+        player_name = re.sub(r'\s*\(\d+\)\s*$', '', label).strip()
+        
+        # Convert hdp into a shot line (e.g. 0.5 -> "shot 1+")
+        try:
+            hdp_float = float(hdp)
+            shots = int(hdp_float + 0.5)
+            shot_line = f"shot {shots}+"
+        except ValueError:
+            continue
+            
+        # Preserve the odds exactly
+        try:
+            odds_float = float(over_val)
+        except ValueError:
+            odds_float = over_val
+            
+        if player_name not in players:
+            players[player_name] = {}
+            
+        players[player_name][shot_line] = odds_float
+        
+    # Format to expected output
+    output = []
+    for player, odds_dict in players.items():
+        output.append({
+            "player": player,
+            "odds": odds_dict
+        })
+        
+    return output
 
+def parse_player_tackles_market(market_data: dict) -> list:
+    """
+    Parses the 'Player Tackles' market data according to the same rules as shots.
+    """
+    odds_list = market_data.get("odds", [])
+    players = {}
+    
+    for entry in odds_list:
+        label = entry.get("label", "")
+        hdp = entry.get("hdp")
+        over_val = entry.get("over")
+        
+        if not label or hdp is None or over_val is None:
+            continue
+            
+        player_name = re.sub(r'\s*\(\d+\)\s*$', '', label).strip()
+        
+        try:
+            hdp_float = float(hdp)
+            tackles = int(hdp_float + 0.5)
+            tackle_line = f"Tackle {tackles}+"
+        except ValueError:
+            continue
+            
+        try:
+            odds_float = float(over_val)
+        except ValueError:
+            odds_float = over_val
+            
+        if player_name not in players:
+            players[player_name] = {}
+            
+        players[player_name][tackle_line] = odds_float
+        
+    output = []
+    for player, odds_dict in players.items():
+        output.append({
+            "player": player,
+            "odds": odds_dict
+        })
+        
+    return output
+
+
+@app.get("/upcoming/player_shots")
+async def get_parsed_player_shots():
+    """
+    Fetch the parsed Player Shots market from the Redis cache instantly.
+    """
     try:
-        players = await bet365.fetch_page_with_hash(hash_path, stat_name=stat_name, wait_seconds=wait)
+        import redis.asyncio as aioredis
+        import os
+        redis_host = os.getenv("REDIS_HOST", "localhost")
+        rc = aioredis.Redis(host=redis_host, port=6379, db=0, decode_responses=True)
+        monitored = await rc.smembers("monitored_events")
+        
+        if monitored:
+            parsed_results = []
+            for eid in monitored:
+                cache_key = f"event:{eid}:player_shots"
+                data_str = await rc.get(cache_key)
+                if data_str:
+                    data = json.loads(data_str)
+                    if "player_shots" in data:
+                        data["player_shots"].sort(key=lambda p: len(p.get("odds", {})), reverse=True)
+                    parsed_results.append(data)
+                    
+            if parsed_results:
+                # Sort matches by date (earliest first)
+                parsed_results.sort(key=lambda x: x.get("match", {}).get("date", ""))
+                return {
+                    "num_of_matches": len(parsed_results),
+                    "matches": parsed_results
+                }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Browser fetch failed: {str(e)}")
-
-    return {"number of player": len(players), "players": players}
-
-
-@app.get("/stats/raw")
-async def get_raw(
-    fixture_id: str = Query(default="197033650"),
-    wait: int = Query(default=10, description="Seconds to wait for data to load"),
-):
-    """
-    Fetch raw intercepted API responses for debugging.
-    Shows exactly what bet365 returns.
-    """
-    fid = clean_fixture_id(fixture_id)
-
+        logger.warning(f"Failed to read from Redis cache: {e}")
+        
+    # Fallback to fetching live
     try:
-        responses = await bet365.fetch_fixture_data(fid)
+        odds_data = await asyncio.to_thread(get_upcoming_odds)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
+        raise HTTPException(status_code=502, detail=f"Failed to fetch base odds: {str(e)}")
+        
+    parsed_results = []
+    
+    for match_obj in odds_data.get("matches_with_odds", []):
+        match_info = match_obj.get("match", {})
+        odds_payload = match_obj.get("odds")
+        
+        parsed_players = []
+        if odds_payload:
+            bookmakers = odds_payload.get('bookmakers', {})
+            bet365_markets = bookmakers.get('Bet365', [])
+            
+            shots_market = next((m for m in bet365_markets if m.get("name") == "Player Shots"), None)
+            
+            if shots_market:
+                parsed_players = parse_player_shots_market(shots_market)
+                
+        parsed_results.append({
+            "match": match_info,
+            "player_shots": parsed_players
+        })
+        
     return {
-        "fixture_id": fid,
-        "responses_captured": len(responses),
-        "responses": [
-            {
-                "index": i,
-                "length": len(r),
-                "preview": r[:2000],
-                "has_player_data": "|PA;" in r,
-                "has_columns": "|CO;" in r,
-            }
-            for i, r in enumerate(responses)
-        ],
+        "num_of_matches": len(parsed_results),
+        "matches": parsed_results
     }
 
+@app.get("/upcoming/player_tackles")
+async def get_parsed_player_tackles():
+    """
+    Fetch the parsed Player Tackles market from the Redis cache instantly.
+    """
+    try:
+        import redis.asyncio as aioredis
+        import os
+        redis_host = os.getenv("REDIS_HOST", "localhost")
+        rc = aioredis.Redis(host=redis_host, port=6379, db=0, decode_responses=True)
+        monitored = await rc.smembers("monitored_events")
+        
+        if monitored:
+            parsed_results = []
+            for eid in monitored:
+                cache_key = f"event:{eid}:player_tackles"
+                data_str = await rc.get(cache_key)
+                if data_str:
+                    data = json.loads(data_str)
+                    if "player_tackles" in data:
+                        data["player_tackles"].sort(key=lambda p: len(p.get("odds", {})), reverse=True)
+                    parsed_results.append(data)
+                    
+            if parsed_results:
+                # Sort matches by date (earliest first)
+                parsed_results.sort(key=lambda x: x.get("match", {}).get("date", ""))
+                return {
+                    "num_of_matches": len(parsed_results),
+                    "matches": parsed_results
+                }
+    except Exception as e:
+        logger.warning(f"Failed to read from Redis cache: {e}")
+
+    return {"num_of_matches": 0, "matches": []}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Sofascore Extraction Pipeline
+# ─────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────
+# Append-Only Sync Background Worker
+# ─────────────────────────────────────────────────────────────────────
+
+async def sync_worker_loop():
+    logger.info("Started Background Worker for Append-Only Sync...")
+    while True:
+        try:
+            from datetime import datetime
+            import pytz
+            
+            from app.database import AsyncSessionLocal
+            from app.services.sofascore import DataExtractionService, SofaScoreService
+            
+            today = datetime.now(pytz.UTC).strftime("%Y-%m-%d")
+            
+            async with AsyncSessionLocal() as db:
+                service = SofaScoreService()
+                extractor = DataExtractionService(service, db=db)
+                await extractor.sync_finished_matches_for_date(16, today)
+                
+        except Exception as e:
+            logger.error(f"Error in background sync worker: {e}")
+            
+        await asyncio.sleep(900) # Check every 15 minutes
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(sync_worker_loop())
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
+from app.services.sofascore import get_sofascore_extraction
+
+@app.get("/api/extraction/date/{date}")
+async def run_extraction_pipeline(date: str, db: AsyncSession = Depends(get_db)):
+    return await get_sofascore_extraction(date, db)
 
 # ─────────────────────────────────────────────────────────────────────
 # Run: python server.py
