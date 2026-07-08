@@ -93,9 +93,10 @@ logger = logging.getLogger("sofascore_extractor")
 
 # --- Services ---
 class SofaScoreService:
-    def __init__(self):
+    def __init__(self, db=None):
         self._base_url = SOFASCORE_BASE_URL.rstrip("/")
         self._proxies = HTTP_PROXIES
+        self.db = db
         # We will keep a pool of sessions equal to the number of proxies
         self._sessions: List[Optional[AsyncSession]] = [None] * len(self._proxies)
         self._request_counts: List[int] = [0] * len(self._proxies)
@@ -321,13 +322,16 @@ class DataExtractionService:
             async def fetch_history(p_id: int):
                 p0 = await self._safe_api_call(self._sofascore.get_player_events(p_id, 0), {})
                 p1 = await self._safe_api_call(self._sofascore.get_player_events(p_id, 1), {})
+                p2 = await self._safe_api_call(self._sofascore.get_player_events(p_id, 2), {})
                 p_match_ids = []
-                for pd in filter(None, [p0, p1]):
+                for pd in filter(None, [p0, p1, p2]):
                     for e in pd.get("events", []):
                         if e.get("id"):
                             p_match_ids.append(e["id"])
                 seen = set()
-                return p_id, [m for m in p_match_ids if not (m in seen or seen.add(m))][:40]
+                # Fetch extra buffer (50) so after dropping failed/unregistered
+                # games we still end up with 30 valid stats entries
+                return p_id, [m for m in p_match_ids if not (m in seen or seen.add(m))][:50]
                 
             history_results = await asyncio.gather(*[fetch_history(p) for p in players_to_fetch])
             player_histories = dict(history_results)
@@ -354,6 +358,10 @@ class DataExtractionService:
             for p_id, match_stat in stats_results:
                 if match_stat["played"]:
                     newly_fetched_stats[p_id].append(match_stat)
+            
+            # Keep only the 30 most recent valid games per player
+            for p_id in newly_fetched_stats:
+                newly_fetched_stats[p_id] = newly_fetched_stats[p_id][:30]
             
             # Save newly fetched stats permanently to DB
             if self.db:
@@ -390,7 +398,6 @@ class DataExtractionService:
                     shots_per_90 = round(sum_shots / x, 2)
                 else:
                     x = tackles_per_90 = shots_per_90 = 0.0
-                
                 p["number_of_match's"] = len(h_match_stats)
                 p["matchs"] = [{
                     "statistics": {
@@ -402,8 +409,156 @@ class DataExtractionService:
                         "shots_per_90_minutes": shots_per_90
                     }
                 }]
-                
+
         return {"date": date, "matches": matches_result}
+
+    async def run_pipeline_stream(self, tournament_id: int, date: str):
+        """
+        Async generator — processes each match independently and yields its data
+        as soon as it is ready, enabling progressive frontend rendering.
+        """
+        logger.info(f"[STREAM] Starting streaming pipeline for {date}")
+        from datetime import datetime, timezone
+        import unicodedata
+
+        # 1. Discover matches
+        matches = await self._safe_api_call(
+            self._sofascore.get_unique_tournament_scheduled_events(tournament_id, date), []
+        )
+        valid_matches = []
+        for m in matches:
+            ts = m.get("startTimestamp")
+            if ts:
+                m_date = datetime.fromtimestamp(ts, timezone.utc).strftime('%Y-%m-%d')
+                if m_date == date and m.get("id") and m.get("status", {}).get("type") in ["notstarted", "delayed"]:
+                    valid_matches.append(m)
+
+        if not valid_matches:
+            return
+
+        # Sort chronologically so the stream populates the UI top-to-bottom
+        valid_matches.sort(key=lambda m: m.get("startTimestamp", 0))
+
+        # 2. Pre-fetch all team rosters in parallel
+        team_ids = set()
+        for m in valid_matches:
+            if m.get("homeTeam", {}).get("id"): team_ids.add(m["homeTeam"]["id"])
+            if m.get("awayTeam", {}).get("id"): team_ids.add(m["awayTeam"]["id"])
+
+        async def _fetch_team(t_id):
+            return t_id, await self._safe_api_call(self._sofascore.get_team_players(t_id), {})
+
+        team_data_map = dict(await asyncio.gather(*[_fetch_team(t) for t in team_ids]))
+
+        # 3. Process each match one at a time and yield
+        for match_info in valid_matches:
+            m_id = match_info["id"]
+            home_team = match_info.get("homeTeam", {}).get("name", "Unknown")
+            away_team  = match_info.get("awayTeam", {}).get("name", "Unknown")
+
+            # Build player map
+            match_players: Dict[int, dict] = {}
+            for t_id in [match_info.get("homeTeam", {}).get("id"), match_info.get("awayTeam", {}).get("id")]:
+                if not t_id or t_id not in team_data_map:
+                    continue
+                for pe in team_data_map[t_id].get("players", []):
+                    p = pe.get("player")
+                    if p and isinstance(p, dict) and p.get("id"):
+                        clean = unicodedata.normalize('NFKD', p.get("name", "")).encode('ASCII', 'ignore').decode('utf-8')
+                        match_players[p["id"]] = {"player_id": p["id"], "name": clean}
+
+            # DB lookup
+            player_stats: Dict[int, list] = {}
+            players_to_fetch: List[int] = []
+            if self.db:
+                from app.models.sofascore import PlayerHistory
+                from sqlalchemy.future import select as sa_select
+                stmt = sa_select(PlayerHistory).where(
+                    PlayerHistory.player_id.in_([str(pid) for pid in match_players])
+                )
+                for entry in (await self.db.execute(stmt)).scalars().all():
+                    player_stats[int(entry.player_id)] = entry.history
+            for pid in match_players:
+                if pid not in player_stats:
+                    players_to_fetch.append(pid)
+
+            logger.info(f"[STREAM] Match {m_id}: {len(player_stats)} players found in DB, {len(players_to_fetch)} new players to fetch.")
+
+            # Fetch history for new players
+
+            if players_to_fetch:
+                async def _hist(pid: int):
+                    p0 = await self._safe_api_call(self._sofascore.get_player_events(pid, 0), {})
+                    p1 = await self._safe_api_call(self._sofascore.get_player_events(pid, 1), {})
+                    p2 = await self._safe_api_call(self._sofascore.get_player_events(pid, 2), {})
+                    ids: List[int] = []
+                    for pd in filter(None, [p0, p1, p2]):
+                        for e in pd.get("events", []):
+                            if e.get("id"): ids.append(e["id"])
+                    seen: set = set()
+                    return pid, [x for x in ids if not (x in seen or seen.add(x))][:50]
+
+                async def _stat(pid: int, gid: int):
+                    d = await self._safe_api_call(self._sofascore.get_event_player_statistics(gid, pid), {})
+                    fs = None
+                    if d and "statistics" in d:
+                        rs = d["statistics"]
+                        fs = {"totalTackle": rs.get("totalTackle", 0),
+                              "totalShots":   rs.get("totalShots", 0),
+                              "minutesPlayed": rs.get("minutesPlayed", 0)}
+                    return pid, {"played": bool(d), "statistics": fs}
+
+                hists = dict(await asyncio.gather(*[_hist(pid) for pid in players_to_fetch]))
+                stat_tasks = [_stat(pid, gid) for pid, gids in hists.items() for gid in gids]
+                stat_results = await asyncio.gather(*stat_tasks)
+
+                newly: Dict[int, list] = {pid: [] for pid in players_to_fetch}
+                for pid, s in stat_results:
+                    if s["played"]:
+                        newly[pid].append(s)
+                for pid in newly:
+                    newly[pid] = newly[pid][:30]
+
+                if self.db:
+                    from sqlalchemy.exc import IntegrityError as IE
+                    from app.models.sofascore import PlayerHistory
+                    try:
+                        for pid, stats in newly.items():
+                            self.db.add(PlayerHistory(player_id=str(pid), history=stats))
+                        await self.db.commit()
+                    except IE:
+                        await self.db.rollback()
+
+                player_stats.update(newly)
+
+            # Format players for this match
+            formatted: List[dict] = []
+            for pid, pinfo in match_players.items():
+                h = player_stats.get(pid, [])
+                valid = [st for st in h if st.get("statistics") is not None]
+                sum_t = sum(st["statistics"].get("totalTackle", 0) for st in valid)
+                sum_s = sum(st["statistics"].get("totalShots", 0)   for st in valid)
+                sum_m = sum(st["statistics"].get("minutesPlayed", 0) for st in valid)
+                if sum_m > 0:
+                    x90 = sum_m / 90.0
+                    t90 = round(sum_t / x90, 2)
+                    s90 = round(sum_s / x90, 2)
+                else:
+                    x90 = t90 = s90 = 0.0
+                pinfo["number_of_match's"] = len(h)
+                pinfo["matchs"] = [{"statistics": {
+                    "totalTackle_in_number_of_match's": sum_t,
+                    "totalShots_in_number_of_match's":  sum_s,
+                    "minutesPlayed_in_number_of_match's": sum_m,
+                    "minutesPlayed_per_90_minutes": round(x90, 2),
+                    "tackles_per_90_minutes": t90,
+                    "shots_per_90_minutes":   s90,
+                }}]
+                formatted.append(pinfo)
+
+            logger.info(f"[STREAM] Yielding match {m_id}: {home_team} v {away_team}")
+            yield {"match_id": m_id, "teams": f"{home_team} v {away_team}",
+                   "number_of_player's": len(formatted), "players": formatted}
 
     async def sync_finished_matches_for_date(self, tournament_id: int, date: str):
         if not self.db:
@@ -472,9 +627,11 @@ class DataExtractionService:
                 result = await self.db.execute(stmt)
                 history_entry = result.scalars().first()
                 if history_entry:
-                    # Append and mark as modified for JSON column
+                    # Sliding window: remove oldest game, append new one, keep max 30
                     current_history = list(history_entry.history)
                     current_history.append(stats)
+                    if len(current_history) > 30:
+                        current_history = current_history[-30:]  # keep last 30
                     history_entry.history = current_history
                     self.db.add(history_entry)
             
@@ -482,6 +639,17 @@ class DataExtractionService:
             self.db.add(SyncedMatch(match_id=str(m_id)))
             await self.db.commit()
             logger.info(f"Successfully synced match {m_id} to persistent database.")
+            
+            # Invalidate today's sofascore_cache so next request recalculates
+            # fresh shots_per_90 / tackles_per_90 from updated player_history
+            from app.models.sofascore import SofascoreCache
+            cache_stmt = select(SofascoreCache).where(SofascoreCache.date == date)
+            cache_result = await self.db.execute(cache_stmt)
+            old_cache = cache_result.scalars().first()
+            if old_cache:
+                await self.db.delete(old_cache)
+                await self.db.commit()
+                logger.info(f"Invalidated sofascore_cache for {date} — fresh stats will be recalculated on next request.")
 
 
 # Global service instance

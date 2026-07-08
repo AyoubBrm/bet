@@ -1485,6 +1485,69 @@ from app.services.sofascore import get_sofascore_extraction
 async def run_extraction_pipeline(date: str, db: AsyncSession = Depends(get_db)):
     return await get_sofascore_extraction(date, db)
 
+@app.get("/api/extraction/stream/{date}")
+async def stream_extraction_pipeline(date: str):
+    """SSE endpoint — streams one match at a time. Uses DB cache for instant loading."""
+    from fastapi.responses import StreamingResponse
+    from app.services.sofascore import DataExtractionService, SofaScoreService
+    from app.models.sofascore import SofascoreCache
+    from app.database import AsyncSessionLocal
+    from sqlalchemy.future import select
+    from sqlalchemy.exc import IntegrityError
+    import json
+
+    async def event_generator():
+        # Open DB session inside the generator so it stays alive for the whole stream
+        async with AsyncSessionLocal() as db:
+            try:
+                # 1. Check Cache First
+                stmt = select(SofascoreCache).where(SofascoreCache.date == date)
+                result = await db.execute(stmt)
+                cache_entry = result.scalars().first()
+                
+                if cache_entry and "matches" in cache_entry.data:
+                    logger.info(f"[STREAM] Found cached data for {date}, streaming instantly.")
+                    for match in cache_entry.data["matches"]:
+                        yield f"data: {json.dumps(match)}\n\n"
+                else:
+                    # 2. Not cached -> Stream live and aggregate for caching
+                    logger.info(f"[STREAM] No cache found for {date}, running live stream.")
+                    service = SofaScoreService()
+                    extractor = DataExtractionService(service, db=db)
+                    
+                    aggregated_matches = []
+                    async for match_data in extractor.run_pipeline_stream(16, date):
+                        aggregated_matches.append(match_data)
+                        yield f"data: {json.dumps(match_data)}\n\n"
+                        
+                    # 3. Save to cache once done
+                    if aggregated_matches:
+                        try:
+                            new_cache = SofascoreCache(
+                                date=date, 
+                                data={"date": date, "matches": aggregated_matches}
+                            )
+                            db.add(new_cache)
+                            await db.commit()
+                            logger.info(f"[STREAM] Saved newly streamed data for {date} to cache.")
+                        except IntegrityError:
+                            await db.rollback()
+                            
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+            finally:
+                yield 'data: {"done": true}\n\n'
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+    )
+
 # ─────────────────────────────────────────────────────────────────────
 # Run: python server.py
 # ─────────────────────────────────────────────────────────────────────

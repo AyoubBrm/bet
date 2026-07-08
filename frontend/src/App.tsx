@@ -36,35 +36,40 @@ function App() {
         // Set loading false immediately so the UI renders the Bet365 data!
         if (isInitial) setIsLoading(false);
         
-        // Fetch Sofascore Data in the background
+        // Fetch Sofascore Data progressively via SSE stream
         if (isInitial && result.matches && result.matches.length > 0) {
-            const uniqueDates = Array.from(new Set(result.matches.map((m: any) => m.match.date.split('T')[0])));
-            // We do not await this try/catch block so it runs independently
-            (async () => {
-                try {
-                    const fetchPromises = uniqueDates.map(date => 
-                        fetch(`http://localhost:8002/api/extraction/date/${date}`).then(res => res.ok ? res.json() : null)
-                    );
-                    const results = await Promise.all(fetchPromises);
-                    
-                    const mergedSofaData: SofascoreResponse = {
-                        match_count: 0,
-                        total_number_of_player_s: 0,
-                        matches: []
-                    };
-                    
-                    for (const res of results) {
-                        if (res && res.matches) {
-                            mergedSofaData.match_count += res.match_count || 0;
-                            mergedSofaData.total_number_of_player_s += res.total_number_of_player_s || 0;
-                            mergedSofaData.matches.push(...res.matches);
-                        }
-                    }
-                    setSofascoreData(mergedSofaData);
-                } catch (err) {
-                    console.error("Failed to fetch Sofascore data:", err);
+          const uniqueDates: string[] = Array.from(
+            new Set(result.matches.map((m: any) => m.match.date.split('T')[0]))
+          );
+
+          // Reset sofascore state so stale data doesn't linger
+          setSofascoreData({ match_count: 0, total_number_of_player_s: 0, matches: [] });
+
+          for (const date of uniqueDates) {
+            const es = new EventSource(`http://localhost:8002/api/extraction/stream/${date}`);
+
+            es.onmessage = (event) => {
+              try {
+                const payload = JSON.parse(event.data);
+                if (payload.done) {
+                  es.close();
+                  return;
                 }
-            })();
+                // Append the new match to state as soon as it arrives
+                setSofascoreData((prev) => ({
+                  match_count: (prev?.match_count ?? 0) + 1,
+                  total_number_of_player_s: (prev?.total_number_of_player_s ?? 0) + (payload["number_of_player's"] ?? 0),
+                  matches: [...(prev?.matches ?? []), payload],
+                }));
+              } catch (e) {
+                console.error("SSE parse error", e);
+              }
+            };
+
+            es.onerror = () => {
+              es.close();
+            };
+          }
         }
       } catch (err: any) {
         setError(err.message || "An unexpected error occurred while fetching data.");
