@@ -6,6 +6,22 @@ import type { ApiResponse, MatchEntry, MatchJobStatus, SofascoreMatch, Sofascore
 import { normalizeName } from "./lib/string-matching";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8002";
+type MarketKey = "shots" | "tackles";
+
+interface MarketSnapshot {
+  data: ApiResponse;
+  sofascoreData: SofascoreResponse | null;
+  matchStatuses: Record<number, MatchJobStatus>;
+  streamComplete: boolean;
+}
+
+function getMarketEndpoint(market: MarketKey): string {
+  return `${API_BASE_URL}/upcoming/player_${market}`;
+}
+
+function getOppositeMarket(market: MarketKey): MarketKey {
+  return market === "shots" ? "tackles" : "shots";
+}
 
 function getMatchTime(entry: MatchEntry): number {
   const timestamp = Date.parse(entry.match.date);
@@ -128,14 +144,135 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [aliasVersion, setAliasVersion] = useState(0);
   const [matchStatuses, setMatchStatuses] = useState<Record<number, MatchJobStatus>>({});
+  const [activeMarket, setActiveMarket] = useState<MarketKey | null>(null);
+  const [marketSnapshots, setMarketSnapshots] = useState<Partial<Record<MarketKey, MarketSnapshot>>>({});
 
-  const [targetEndpoint, setTargetEndpoint] = useState<string | null>(null);
+  const selectMarket = (market: MarketKey) => {
+    setActiveMarket(market);
+    setError(null);
+
+    const snapshot = marketSnapshots[market];
+    if (snapshot) {
+      setData(snapshot.data);
+      setSofascoreData(snapshot.sofascoreData);
+      setMatchStatuses(snapshot.matchStatuses);
+      setIsLoading(false);
+      return;
+    }
+
+    setData(null);
+    setSofascoreData(null);
+    setMatchStatuses({});
+    setIsLoading(true);
+  };
 
   useEffect(() => {
     let intervalId: any;
     const controller = new AbortController();
     let cancelled = false;
     let streamActive = false;
+
+    if (!activeMarket) {
+      setIsLoading(false);
+      return () => {
+        cancelled = true;
+        controller.abort();
+      };
+    }
+
+    const targetEndpoint = getMarketEndpoint(activeMarket);
+    const snapshotAtStart = marketSnapshots[activeMarket];
+    const hasSnapshotAtStart = Boolean(snapshotAtStart?.data);
+    let currentSnapshot = snapshotAtStart;
+
+    const saveMarketSnapshot = (patch: Partial<MarketSnapshot>) => {
+      const previous = currentSnapshot;
+      const snapshotData = patch.data ?? previous?.data;
+      if (!snapshotData) return;
+
+      const nextSnapshot: MarketSnapshot = {
+        data: snapshotData,
+        sofascoreData: patch.sofascoreData ?? previous?.sofascoreData ?? null,
+        matchStatuses: patch.matchStatuses ?? previous?.matchStatuses ?? {},
+        streamComplete: patch.streamComplete ?? previous?.streamComplete ?? false,
+      };
+      currentSnapshot = nextSnapshot;
+
+      setMarketSnapshots((current) => {
+        return {
+          ...current,
+          [activeMarket]: nextSnapshot,
+        };
+      });
+    };
+
+    const reconcileStatusesForOdds = (matches: MatchEntry[]): Record<number, MatchJobStatus> => {
+      const previousStatuses = currentSnapshot?.matchStatuses ?? {};
+      return Object.fromEntries(
+        matches.map((entry) => [
+          entry.match.id,
+          previousStatuses[entry.match.id] ?? "queued" as MatchJobStatus,
+        ])
+      );
+    };
+
+    const getMatchesMissingSofascore = (matches: MatchEntry[]): MatchEntry[] => {
+      const currentSofascore = currentSnapshot?.sofascoreData;
+      if (!currentSofascore || currentSofascore.matches.length === 0) {
+        return matches.filter((entry) => currentSnapshot?.matchStatuses?.[entry.match.id] !== "failed");
+      }
+
+      return matches.filter((entry) => {
+        const status = currentSnapshot?.matchStatuses?.[entry.match.id];
+        if (status === "failed") return false;
+        return !findSofascoreMatch(entry, currentSofascore);
+      });
+    };
+
+    const updateMatchStatuses = (
+      updater:
+        | Record<number, MatchJobStatus>
+        | ((current: Record<number, MatchJobStatus>) => Record<number, MatchJobStatus>)
+    ) => {
+      setMatchStatuses((current) => {
+        const next = typeof updater === "function" ? updater(current) : updater;
+        saveMarketSnapshot({ matchStatuses: next });
+        return next;
+      });
+    };
+
+    const prefetchMarketData = async (market: MarketKey) => {
+      if (marketSnapshots[market]?.data) return;
+
+      try {
+        const response = await fetch(getMarketEndpoint(market));
+        if (!response.ok) return;
+
+        const result = await response.json();
+        const sortedResult: ApiResponse = {
+          ...result,
+          matches: sortMatchEntries(result.matches ?? []),
+        };
+        const initialStatuses = Object.fromEntries(
+          sortedResult.matches.map((entry) => [entry.match.id, "queued" as MatchJobStatus])
+        );
+
+        setMarketSnapshots((current) => {
+          if (current[market]?.data) return current;
+          return {
+            ...current,
+            [market]: {
+              data: sortedResult,
+              sofascoreData: null,
+              matchStatuses: initialStatuses,
+              streamComplete: false,
+            },
+          };
+        });
+      } catch {
+        // Prefetch is only for instant tab switching; foreground fetch still handles errors.
+      }
+    };
 
     const streamSofascoreMatches = async (
       sortedMatches: MatchEntry[],
@@ -186,7 +323,9 @@ function App() {
         if (payload.done) return;
 
         const publishMatches = () => {
-          setSofascoreData(buildSofascoreResponse([...matchesById.values()]));
+          const nextSofascoreData = buildSofascoreResponse([...matchesById.values()]);
+          setSofascoreData(nextSofascoreData);
+          saveMarketSnapshot({ sofascoreData: nextSofascoreData });
         };
 
         const findMatchedEntry = (matchPayload: Partial<SofascoreMatch>) => {
@@ -205,7 +344,7 @@ function App() {
         const markMatchStatus = (matchPayload: Partial<SofascoreMatch>, status: MatchJobStatus) => {
           const matchedEntry = findMatchedEntry(matchPayload);
           if (matchedEntry) {
-            setMatchStatuses((current) => ({
+            updateMatchStatuses((current) => ({
               ...current,
               [matchedEntry.match.id]: status,
             }));
@@ -225,7 +364,7 @@ function App() {
 
         if (payload.type === "status") {
           if (payload.bet365_event_id) {
-            setMatchStatuses((current) => ({
+            updateMatchStatuses((current) => ({
               ...current,
               [Number(payload.bet365_event_id)]: payload.status,
             }));
@@ -308,7 +447,6 @@ function App() {
     };
 
     const fetchData = async (isInitial: boolean) => {
-      if (!targetEndpoint) return;
       try {
         if (isInitial) setIsLoading(true);
         setError(null);
@@ -328,26 +466,42 @@ function App() {
         };
         setData(sortedResult);
         if (isInitial) {
-          setMatchStatuses(
-            Object.fromEntries(
-              sortedResult.matches.map((entry) => [entry.match.id, "queued" as MatchJobStatus])
-            )
-          );
+          const initialStatuses = reconcileStatusesForOdds(sortedResult.matches);
+          const emptySofascoreData = buildSofascoreResponse([]);
+          setSofascoreData(emptySofascoreData);
+          setMatchStatuses(initialStatuses);
+          saveMarketSnapshot({
+            data: sortedResult,
+            sofascoreData: emptySofascoreData,
+            matchStatuses: initialStatuses,
+            streamComplete: false,
+          });
+        } else {
+          const nextStatuses = reconcileStatusesForOdds(sortedResult.matches);
+          setMatchStatuses(nextStatuses);
+          saveMarketSnapshot({ data: sortedResult, matchStatuses: nextStatuses });
         }
         
         // Set loading false immediately so the UI renders the Bet365 data!
         if (isInitial) setIsLoading(false);
-        
-        // Stream one global sorted match queue so finished matches render immediately.
-        if (isInitial && sortedResult.matches && sortedResult.matches.length > 0) {
-          // Reset sofascore state so stale data doesn't linger
-          setSofascoreData(buildSofascoreResponse([]));
 
-          const matchesById = new Map<number, SofascoreMatch>();
+        if (isInitial) {
+          void prefetchMarketData(getOppositeMarket(activeMarket));
+        }
+        
+        // Stream only matches missing SofaScore data. Odds-only updates stay frontend-only.
+        const missingMatches = getMatchesMissingSofascore(sortedResult.matches ?? []);
+        if (missingMatches.length > 0) {
+          const matchesById = new Map<number, SofascoreMatch>(
+            (currentSnapshot?.sofascoreData?.matches ?? []).map((match) => [match.match_id, match])
+          );
           if (cancelled) return;
           streamActive = true;
           try {
-            await streamSofascoreMatches(sortedResult.matches, matchesById);
+            await streamSofascoreMatches(missingMatches, matchesById);
+            if (!cancelled) {
+              saveMarketSnapshot({ streamComplete: true });
+            }
           } finally {
             streamActive = false;
           }
@@ -359,26 +513,22 @@ function App() {
       }
     };
 
-    if (targetEndpoint) {
-      // Fetch immediately with loading state
-      fetchData(true);
-      
-      // Set up silent background polling every 5 seconds
-      intervalId = setInterval(() => {
-        if (!streamActive) {
-          fetchData(false);
-        }
-      }, 5000);
-    } else {
-      setIsLoading(false);
-    }
+    // Fetch immediately. Cached markets render first and refresh silently.
+    fetchData(!hasSnapshotAtStart);
+
+    // Set up silent background polling every 5 seconds
+    intervalId = setInterval(() => {
+      if (!streamActive) {
+        fetchData(false);
+      }
+    }, 5000);
     
     return () => {
       cancelled = true;
       controller.abort();
       if (intervalId) clearInterval(intervalId);
     };
-  }, [targetEndpoint]);
+  }, [activeMarket]);
 
   // Filter matches based on search query (teams or players inside the match)
   const filteredMatches = useMemo(() => data?.matches.filter((entry: MatchEntry) => {
@@ -422,15 +572,15 @@ function App() {
             <h3 className="text-lg font-bold mb-4 text-text">Select Market</h3>
             <div className="flex flex-col sm:flex-row gap-4">
               <button 
-                onClick={() => setTargetEndpoint(`${API_BASE_URL}/upcoming/player_shots`)}
-                disabled={isLoading}
+                onClick={() => selectMarket("shots")}
+                disabled={isLoading && !marketSnapshots.shots?.data}
                 className={`px-8 py-3 rounded-lg font-medium disabled:opacity-50 transition-all flex items-center justify-center flex-1 ${
-                  targetEndpoint?.includes('player_shots')
+                  activeMarket === 'shots'
                     ? 'bg-primary text-white border-transparent'
                     : 'bg-surface hover:bg-surface-hover text-text border border-border'
                 }`}
               >
-                {isLoading && targetEndpoint?.includes("player_shots") ? (
+                {isLoading && activeMarket === "shots" ? (
                   <span className="flex items-center gap-2">
                     <span className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin"></span>
                     Fetching Shots...
@@ -439,15 +589,15 @@ function App() {
               </button>
 
               <button 
-                onClick={() => setTargetEndpoint(`${API_BASE_URL}/upcoming/player_tackles`)}
-                disabled={isLoading}
+                onClick={() => selectMarket("tackles")}
+                disabled={isLoading && !marketSnapshots.tackles?.data}
                 className={`px-8 py-3 rounded-lg font-medium disabled:opacity-50 transition-all flex items-center justify-center flex-1 ${
-                  targetEndpoint?.includes('player_tackles')
+                  activeMarket === 'tackles'
                     ? 'bg-primary text-white border-transparent'
                     : 'bg-surface hover:bg-surface-hover text-text border border-border'
                 }`}
               >
-                {isLoading && targetEndpoint?.includes("player_tackles") ? (
+                {isLoading && activeMarket === "tackles" ? (
                   <span className="flex items-center gap-2">
                     <span className="w-4 h-4 border-2 border-primary/30 border-t-primary rounded-full animate-spin"></span>
                     Fetching Tackles...
@@ -496,7 +646,7 @@ function App() {
                 searchQuery={searchQuery}
                 sofascoreMatch={findSofascoreMatch(entry, sofascoreData)}
                 status={matchStatuses[entry.match.id]}
-                marketType={targetEndpoint?.includes('player_shots') ? 'shots' : 'tackles'}
+                marketType={activeMarket === 'shots' ? 'shots' : 'tackles'}
                 aliasVersion={aliasVersion}
               />
             ))}
