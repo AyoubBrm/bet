@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { MatchEntry, SofascoreResponse } from "../../types/api";
+import type { MatchEntry, MatchJobStatus, SofascoreMatch } from "../../types/api";
 import { PlayerTable } from "./PlayerTable";
 import { ChevronDown, ChevronUp, Calendar, Clock, ExternalLink } from "lucide-react";
 import { cn } from "../../lib/utils";
@@ -7,12 +7,13 @@ import { cn } from "../../lib/utils";
 interface MatchCardProps {
   entry: MatchEntry;
   searchQuery: string;
-  sofascoreData: SofascoreResponse | null;
+  sofascoreMatch: SofascoreMatch | null;
+  status?: MatchJobStatus;
   marketType: 'shots' | 'tackles';
   aliasVersion: number;
 }
 
-export function MatchCard({ entry, searchQuery, sofascoreData, marketType, aliasVersion }: MatchCardProps) {
+export function MatchCard({ entry, searchQuery, sofascoreMatch, status, marketType, aliasVersion }: MatchCardProps) {
   const [isExpanded, setIsExpanded] = useState(false);
 
   const { match, player_shots, player_tackles } = entry;
@@ -42,7 +43,22 @@ export function MatchCard({ entry, searchQuery, sofascoreData, marketType, alias
             <span className="w-1 h-1 rounded-full bg-border"></span>
             <span className="flex items-center gap-1.5"><Clock className="w-4 h-4 text-primary/70" /> {match.date.split('T')[1]?.replace('Z', '')}</span>
             <span className="w-1 h-1 rounded-full bg-border"></span>
-            <span className="px-2 py-0.5 rounded text-xs bg-surface text-text-muted border border-border">ID: {match.id}</span>
+            <span className="px-2 py-0.5 rounded text-xs bg-surface text-text-muted border border-border">Odds ID: {match.id}</span>
+            {status && (
+              <>
+                <span className="w-1 h-1 rounded-full bg-border"></span>
+                <span className={cn(
+                  "px-2 py-0.5 rounded text-xs border capitalize",
+                  status === "done" || status === "cached"
+                    ? "bg-primary/10 text-primary border-primary/20"
+                    : status === "failed"
+                      ? "bg-danger/10 text-danger border-danger/20"
+                      : "bg-surface text-text-muted border-border"
+                )}>
+                  {status}
+                </span>
+              </>
+            )}
             <span className="w-1 h-1 rounded-full bg-border"></span>
             <a 
               href={`https://www.bet365.com/#/AX/K^${encodeURIComponent(match.home + ' ' + match.away)}/`}
@@ -83,7 +99,7 @@ export function MatchCard({ entry, searchQuery, sofascoreData, marketType, alias
         )}
       >
         <div className="overflow-hidden bg-background/50 border-t border-border">
-          <PlayerTable players={filteredPlayers} sofascoreData={sofascoreData} marketType={marketType} aliasVersion={aliasVersion} />
+          <PlayerTable players={filteredPlayers} sofascoreMatch={sofascoreMatch} marketType={marketType} aliasVersion={aliasVersion} />
         </div>
       </div>
     </div>

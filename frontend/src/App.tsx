@@ -1,8 +1,124 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Header } from "./components/layout/Header";
 import { MatchCard } from "./components/match/MatchCard";
 import { Skeleton } from "./components/ui/Skeleton";
-import type { ApiResponse, MatchEntry, SofascoreResponse } from "./types/api";
+import type { ApiResponse, MatchEntry, MatchJobStatus, SofascoreMatch, SofascoreResponse } from "./types/api";
+import { normalizeName } from "./lib/string-matching";
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8002";
+
+function getMatchTime(entry: MatchEntry): number {
+  const timestamp = Date.parse(entry.match.date);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function sortMatchEntries(matches: MatchEntry[]): MatchEntry[] {
+  return [...matches].sort((a, b) => {
+    const timeDiff = getMatchTime(a) - getMatchTime(b);
+    if (timeDiff !== 0) return timeDiff;
+    return a.match.id - b.match.id;
+  });
+}
+
+function getSofascoreTime(match: SofascoreMatch): number {
+  if (match.startTimestamp) return match.startTimestamp * 1000;
+  const timestamp = Date.parse(match.date ?? "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function sortSofascoreMatches(matches: SofascoreMatch[]): SofascoreMatch[] {
+  return [...matches].sort((a, b) => {
+    const timeDiff = getSofascoreTime(a) - getSofascoreTime(b);
+    if (timeDiff !== 0) return timeDiff;
+    return a.teams.localeCompare(b.teams);
+  });
+}
+
+function buildSofascoreResponse(matches: SofascoreMatch[]): SofascoreResponse {
+  const sortedMatches = sortSofascoreMatches(matches);
+  return {
+    match_count: sortedMatches.length,
+    total_number_of_player_s: sortedMatches.reduce(
+      (sum, match) => sum + (match["number_of_player's"] ?? match.number_of_player_s ?? 0),
+      0
+    ),
+    matches: sortedMatches,
+  };
+}
+
+function normalizeTeamName(name: string): string {
+  return normalizeName(name)
+    .replace(/\b(fc|cf|sc|club)\b/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getSofascoreTeams(match: SofascoreMatch): [string, string] {
+  if (match.home && match.away) {
+    return [match.home, match.away];
+  }
+  const parts = match.teams.split(" v ");
+  return [parts[0] ?? "", parts[1] ?? ""];
+}
+
+function sameMatchDay(entry: MatchEntry, match: SofascoreMatch): boolean {
+  const oddsDate = entry.match.date.split("T")[0];
+  const sofaDate = match.startTimestamp
+    ? new Date(match.startTimestamp * 1000).toISOString().split("T")[0]
+    : match.date?.split("T")[0];
+  return !sofaDate || oddsDate === sofaDate;
+}
+
+function getKickoffDistance(entry: MatchEntry, match: SofascoreMatch): number {
+  const oddsTime = getMatchTime(entry);
+  const sofaTime = getSofascoreTime(match);
+  if (!oddsTime || !sofaTime) return Number.MAX_SAFE_INTEGER;
+  return Math.abs(oddsTime - sofaTime);
+}
+
+function findSofascoreMatch(
+  entry: MatchEntry,
+  sofascoreData: SofascoreResponse | null
+): SofascoreMatch | null {
+  if (!sofascoreData) return null;
+
+  const directMatch = sofascoreData.matches.find(
+    (match) => String(match.bet365_event_id ?? "") === String(entry.match.id)
+  );
+  if (directMatch) return directMatch;
+
+  // Bet365 event ids and SofaScore event ids are unrelated. Match by teams + kickoff.
+  const home = normalizeTeamName(entry.match.home);
+  const away = normalizeTeamName(entry.match.away);
+  const candidates: SofascoreMatch[] = [];
+
+  for (const match of sofascoreData.matches) {
+    const [sofaHomeRaw, sofaAwayRaw] = getSofascoreTeams(match);
+    const sofaHome = normalizeTeamName(sofaHomeRaw);
+    const sofaAway = normalizeTeamName(sofaAwayRaw);
+    const sameTeams =
+      (home === sofaHome && away === sofaAway) ||
+      (home === sofaAway && away === sofaHome);
+
+    if (!sameTeams) continue;
+    candidates.push(match);
+  }
+
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    const dayDiff = Number(!sameMatchDay(entry, a)) - Number(!sameMatchDay(entry, b));
+    if (dayDiff !== 0) return dayDiff;
+
+    const timeDiff = getKickoffDistance(entry, a) - getKickoffDistance(entry, b);
+    if (timeDiff !== 0) return timeDiff;
+
+    return a.teams.localeCompare(b.teams);
+  });
+
+  return candidates[0];
+}
 
 function App() {
   const [data, setData] = useState<ApiResponse | null>(null);
@@ -11,11 +127,185 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [aliasVersion, setAliasVersion] = useState(0);
+  const [matchStatuses, setMatchStatuses] = useState<Record<number, MatchJobStatus>>({});
 
   const [targetEndpoint, setTargetEndpoint] = useState<string | null>(null);
 
   useEffect(() => {
     let intervalId: any;
+    const controller = new AbortController();
+    let cancelled = false;
+    let streamActive = false;
+
+    const streamSofascoreMatches = async (
+      sortedMatches: MatchEntry[],
+      matchesById: Map<number, SofascoreMatch>
+    ): Promise<void> => {
+      const response = await fetch(`${API_BASE_URL}/api/extraction/stream/matches`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          matches: sortedMatches.map((entry) => ({
+            id: entry.match.id,
+            home: entry.match.home,
+            away: entry.match.away,
+            date: entry.match.date,
+            players: Array.from(
+              new Set((entry.player_shots ?? entry.player_tackles ?? []).map((player) => player.player).filter(Boolean))
+            ),
+          })),
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to stream SofaScore match data: ${response.statusText}`);
+      }
+
+      if (!response.body) {
+        throw new Error("SofaScore match stream did not return a readable body.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      const handleEvent = (rawEvent: string) => {
+        const data = rawEvent
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n")
+          .trim();
+
+        if (!data) return;
+
+        const payload = JSON.parse(data);
+        if (payload.done) return;
+
+        const publishMatches = () => {
+          setSofascoreData(buildSofascoreResponse([...matchesById.values()]));
+        };
+
+        const findMatchedEntry = (matchPayload: Partial<SofascoreMatch>) => {
+          if (matchPayload.bet365_event_id) {
+            return sortedMatches.find((entry) => String(entry.match.id) === String(matchPayload.bet365_event_id));
+          }
+          if (!matchPayload.match_id || !matchPayload.teams) {
+            return undefined;
+          }
+          return sortedMatches.find((entry) => findSofascoreMatch(
+                entry,
+                buildSofascoreResponse([matchPayload as SofascoreMatch])
+              ));
+        };
+
+        const markMatchStatus = (matchPayload: Partial<SofascoreMatch>, status: MatchJobStatus) => {
+          const matchedEntry = findMatchedEntry(matchPayload);
+          if (matchedEntry) {
+            setMatchStatuses((current) => ({
+              ...current,
+              [matchedEntry.match.id]: status,
+            }));
+          }
+        };
+
+        const upsertMatch = (matchPayload: SofascoreMatch) => {
+          if (!matchPayload?.match_id) return;
+          const existing = matchesById.get(matchPayload.match_id);
+          matchesById.set(matchPayload.match_id, {
+            ...existing,
+            ...matchPayload,
+            players: matchPayload.players ?? existing?.players ?? [],
+          });
+          publishMatches();
+        };
+
+        if (payload.type === "status") {
+          if (payload.bet365_event_id) {
+            setMatchStatuses((current) => ({
+              ...current,
+              [Number(payload.bet365_event_id)]: payload.status,
+            }));
+          }
+          return;
+        }
+
+        if (payload.type === "match_started") {
+          upsertMatch(payload.data);
+          markMatchStatus(payload.data, "calculating");
+          return;
+        }
+
+        if (payload.type === "player_done") {
+          const playerPayload = payload.data;
+          const matchId = Number(playerPayload?.match_id);
+          const player = playerPayload?.player;
+          if (!matchId || !player) return;
+
+          const existing = matchesById.get(matchId) ?? {
+            match_id: matchId,
+            bet365_event_id: playerPayload.bet365_event_id,
+            teams: "",
+            players: [],
+          };
+
+          const playerExists = existing.players.some((currentPlayer) => currentPlayer.player_id === player.player_id);
+          const updatedPlayers = playerExists
+            ? existing.players.map((currentPlayer) =>
+                currentPlayer.player_id === player.player_id ? player : currentPlayer
+              )
+            : [...existing.players, player];
+
+          matchesById.set(matchId, {
+            ...existing,
+            bet365_event_id: playerPayload.bet365_event_id ?? existing.bet365_event_id,
+            players: updatedPlayers,
+          });
+          markMatchStatus(matchesById.get(matchId) ?? existing, "calculating");
+          publishMatches();
+          return;
+        }
+
+        if (payload.type === "match_done") {
+          const donePayload = payload.data;
+          if (donePayload?.match) {
+            upsertMatch(donePayload.match);
+            markMatchStatus(donePayload.match, "done");
+          } else {
+            markMatchStatus(donePayload, "done");
+          }
+          return;
+        }
+
+        const matchPayload = payload.type === "match" ? payload.data : payload;
+        if (!matchPayload?.match_id) return;
+
+        upsertMatch(matchPayload);
+        markMatchStatus(matchPayload, "done");
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done }).replace(/\r\n/g, "\n");
+
+        let eventEnd = buffer.indexOf("\n\n");
+        while (eventEnd !== -1) {
+          const rawEvent = buffer.slice(0, eventEnd);
+          buffer = buffer.slice(eventEnd + 2);
+          handleEvent(rawEvent);
+          eventEnd = buffer.indexOf("\n\n");
+        }
+
+        if (done) break;
+      }
+
+      if (buffer.trim()) {
+        handleEvent(buffer);
+      }
+    };
 
     const fetchData = async (isInitial: boolean) => {
       if (!targetEndpoint) return;
@@ -23,55 +313,47 @@ function App() {
         if (isInitial) setIsLoading(true);
         setError(null);
         
-        const response = await fetch(targetEndpoint);
+        const response = await fetch(targetEndpoint, {
+          signal: controller.signal,
+        });
         
         if (!response.ok) {
           throw new Error(`Failed to fetch data: ${response.statusText}`);
         }
         
         const result = await response.json();
-        console.log("FETCHED DATA:", result);
-        setData(result);
+        const sortedResult: ApiResponse = {
+          ...result,
+          matches: sortMatchEntries(result.matches ?? []),
+        };
+        setData(sortedResult);
+        if (isInitial) {
+          setMatchStatuses(
+            Object.fromEntries(
+              sortedResult.matches.map((entry) => [entry.match.id, "queued" as MatchJobStatus])
+            )
+          );
+        }
         
         // Set loading false immediately so the UI renders the Bet365 data!
         if (isInitial) setIsLoading(false);
         
-        // Fetch Sofascore Data progressively via SSE stream
-        if (isInitial && result.matches && result.matches.length > 0) {
-          const uniqueDates: string[] = Array.from(
-            new Set(result.matches.map((m: any) => m.match.date.split('T')[0]))
-          );
-
+        // Stream one global sorted match queue so finished matches render immediately.
+        if (isInitial && sortedResult.matches && sortedResult.matches.length > 0) {
           // Reset sofascore state so stale data doesn't linger
-          setSofascoreData({ match_count: 0, total_number_of_player_s: 0, matches: [] });
+          setSofascoreData(buildSofascoreResponse([]));
 
-          for (const date of uniqueDates) {
-            const es = new EventSource(`http://localhost:8002/api/extraction/stream/${date}`);
-
-            es.onmessage = (event) => {
-              try {
-                const payload = JSON.parse(event.data);
-                if (payload.done) {
-                  es.close();
-                  return;
-                }
-                // Append the new match to state as soon as it arrives
-                setSofascoreData((prev) => ({
-                  match_count: (prev?.match_count ?? 0) + 1,
-                  total_number_of_player_s: (prev?.total_number_of_player_s ?? 0) + (payload["number_of_player's"] ?? 0),
-                  matches: [...(prev?.matches ?? []), payload],
-                }));
-              } catch (e) {
-                console.error("SSE parse error", e);
-              }
-            };
-
-            es.onerror = () => {
-              es.close();
-            };
+          const matchesById = new Map<number, SofascoreMatch>();
+          if (cancelled) return;
+          streamActive = true;
+          try {
+            await streamSofascoreMatches(sortedResult.matches, matchesById);
+          } finally {
+            streamActive = false;
           }
         }
       } catch (err: any) {
+        if (err?.name === "AbortError") return;
         setError(err.message || "An unexpected error occurred while fetching data.");
         if (isInitial) setIsLoading(false);
       }
@@ -83,19 +365,23 @@ function App() {
       
       // Set up silent background polling every 5 seconds
       intervalId = setInterval(() => {
-        fetchData(false);
+        if (!streamActive) {
+          fetchData(false);
+        }
       }, 5000);
     } else {
       setIsLoading(false);
     }
     
     return () => {
+      cancelled = true;
+      controller.abort();
       if (intervalId) clearInterval(intervalId);
     };
   }, [targetEndpoint]);
 
   // Filter matches based on search query (teams or players inside the match)
-  const filteredMatches = data?.matches.filter((entry: MatchEntry) => {
+  const filteredMatches = useMemo(() => data?.matches.filter((entry: MatchEntry) => {
     const q = searchQuery.toLowerCase();
     
     // Check match teams
@@ -111,7 +397,7 @@ function App() {
     }
     
     return false;
-  });
+  }), [data, searchQuery]);
 
   return (
     <div className="min-h-screen bg-background text-text">
@@ -136,7 +422,7 @@ function App() {
             <h3 className="text-lg font-bold mb-4 text-text">Select Market</h3>
             <div className="flex flex-col sm:flex-row gap-4">
               <button 
-                onClick={() => setTargetEndpoint('http://localhost:8002/upcoming/player_shots')}
+                onClick={() => setTargetEndpoint(`${API_BASE_URL}/upcoming/player_shots`)}
                 disabled={isLoading}
                 className={`px-8 py-3 rounded-lg font-medium disabled:opacity-50 transition-all flex items-center justify-center flex-1 ${
                   targetEndpoint?.includes('player_shots')
@@ -153,7 +439,7 @@ function App() {
               </button>
 
               <button 
-                onClick={() => setTargetEndpoint('http://localhost:8002/upcoming/player_tackles')}
+                onClick={() => setTargetEndpoint(`${API_BASE_URL}/upcoming/player_tackles`)}
                 disabled={isLoading}
                 className={`px-8 py-3 rounded-lg font-medium disabled:opacity-50 transition-all flex items-center justify-center flex-1 ${
                   targetEndpoint?.includes('player_tackles')
@@ -208,7 +494,8 @@ function App() {
                 key={entry.match.id} 
                 entry={entry} 
                 searchQuery={searchQuery}
-                sofascoreData={sofascoreData}
+                sofascoreMatch={findSofascoreMatch(entry, sofascoreData)}
+                status={matchStatuses[entry.match.id]}
                 marketType={targetEndpoint?.includes('player_shots') ? 'shots' : 'tackles'}
                 aliasVersion={aliasVersion}
               />

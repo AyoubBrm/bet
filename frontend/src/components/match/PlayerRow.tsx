@@ -1,17 +1,17 @@
 import { useState, useMemo, useEffect } from "react";
-import type { Player, SofascoreResponse } from "../../types/api";
-import { isPlayerMatch } from "../../lib/string-matching";
+import type { Player, SofascoreMatch } from "../../types/api";
+import { isSofascorePlayerForBet365 } from "../../lib/sofascore-player-match";
 import { calculateEdgeData } from "../../lib/math";
 
 interface PlayerRowProps {
   player: Player;
-  sofascoreData: SofascoreResponse | null;
+  sofascoreMatch: SofascoreMatch | null;
   marketType: 'shots' | 'tackles';
   aliasVersion: number;
   defaultLine?: string;
 }
 
-export function PlayerRow({ player, sofascoreData, marketType, aliasVersion, defaultLine }: PlayerRowProps) {
+export function PlayerRow({ player, sofascoreMatch, marketType, aliasVersion, defaultLine }: PlayerRowProps) {
   // Extract all available shot lines (e.g., "shot +1", "shot +2")
   // Sort them numerically so +1 comes before +2, +10, etc.
   const shotOptions = useMemo(() => {
@@ -39,21 +39,17 @@ export function PlayerRow({ player, sofascoreData, marketType, aliasVersion, def
 
   // Find the player in Sofascore data
   const sofaStats = useMemo(() => {
-    if (!sofascoreData) return null;
+    if (!sofascoreMatch) return null;
     
-    // We search across all matches in the Sofascore payload for this player's name
-    for (const match of sofascoreData.matches) {
-      for (const p of match.players) {
-        if (isPlayerMatch(player.player, p.name)) {
-          // Found fuzzy/alias match!
-          if (p.matchs && p.matchs.length > 0 && p.matchs[0].statistics) {
-             return p.matchs[0].statistics;
-          }
+    for (const p of sofascoreMatch.players) {
+      if (isSofascorePlayerForBet365(player.player, p)) {
+        if (p.matchs && p.matchs.length > 0 && p.matchs[0].statistics) {
+           return p.matchs[0].statistics;
         }
       }
     }
     return null;
-  }, [player.player, sofascoreData, aliasVersion]);
+  }, [player.player, sofascoreMatch, aliasVersion]);
 
   // Run Edge Calculation
   const lambda = marketType === 'shots' 

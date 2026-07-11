@@ -1,7 +1,7 @@
 import { useMemo } from "react";
-import type { Player, SofascoreResponse } from "../../types/api";
+import type { Player, SofascoreMatch } from "../../types/api";
 import { PlayerRow } from "./PlayerRow";
-import { isPlayerMatch } from "../../lib/string-matching";
+import { isSofascorePlayerForBet365 } from "../../lib/sofascore-player-match";
 import { calculateEdgeData } from "../../lib/math";
 
 // Odds range considered "close to 2.0"
@@ -10,7 +10,7 @@ const ODDS_MAX = 2.50;
 
 interface PlayerTableProps {
   players: Player[];
-  sofascoreData: SofascoreResponse | null;
+  sofascoreMatch: SofascoreMatch | null;
   marketType: 'shots' | 'tackles';
   aliasVersion: number;
 }
@@ -33,31 +33,29 @@ function getBestLine(player: Player): { line: string; odds: number } | null {
 /** Looks up the sofascore stats for a player */
 function getSofaStats(
   player: Player,
-  sofascoreData: SofascoreResponse | null
+  sofascoreMatch: SofascoreMatch | null
 ) {
-  if (!sofascoreData) return null;
-  for (const match of sofascoreData.matches) {
-    for (const p of match.players) {
-      if (isPlayerMatch(player.player, p.name)) {
-        if (p.matchs && p.matchs.length > 0 && p.matchs[0].statistics) {
-          return p.matchs[0].statistics;
-        }
+  if (!sofascoreMatch) return null;
+  for (const p of sofascoreMatch.players) {
+    if (isSofascorePlayerForBet365(player.player, p)) {
+      if (p.matchs && p.matchs.length > 0 && p.matchs[0].statistics) {
+        return p.matchs[0].statistics;
       }
     }
   }
   return null;
 }
 
-export function PlayerTable({ players, sofascoreData, marketType, aliasVersion }: PlayerTableProps) {
-  // Filter to odds near 2.0, compute EV for each player, then sort by EV descending
+export function PlayerTable({ players, sofascoreMatch, marketType, aliasVersion }: PlayerTableProps) {
+  // Keep rows stable while partial SofaScore stats are still streaming in.
   const enrichedPlayers = useMemo(() => {
-    return players
-      .map((player) => {
+    const mappedPlayers = players
+      .map((player, index) => {
         const best = getBestLine(player);
         // Only keep players whose best line is "close to 2.0"
         if (!best || best.odds < ODDS_MIN || best.odds > ODDS_MAX) return null;
 
-        const sofaStats = getSofaStats(player, sofascoreData);
+        const sofaStats = getSofaStats(player, sofascoreMatch);
         const lambda =
           marketType === 'shots'
             ? sofaStats?.shots_per_90_minutes
@@ -66,11 +64,16 @@ export function PlayerTable({ players, sofascoreData, marketType, aliasVersion }
         const edgeData = calculateEdgeData(best.line, best.odds, lambda);
         const ev = edgeData?.evAtBookOdds ?? -Infinity;
 
-        return { player, bestLine: best.line, ev };
+        return { player, bestLine: best.line, ev, hasStats: Boolean(sofaStats), index };
       })
-      .filter((x): x is { player: Player; bestLine: string; ev: number } => x !== null)
-      .sort((a, b) => b.ev - a.ev); // highest EV first
-  }, [players, sofascoreData, marketType, aliasVersion]);
+      .filter((x): x is { player: Player; bestLine: string; ev: number; hasStats: boolean; index: number } => x !== null);
+
+    const allRowsHaveStats = mappedPlayers.length > 0 && mappedPlayers.every((entry) => entry.hasStats);
+    if (allRowsHaveStats) {
+      return [...mappedPlayers].sort((a, b) => b.ev - a.ev);
+    }
+    return mappedPlayers;
+  }, [players, sofascoreMatch, marketType, aliasVersion]);
 
   if (enrichedPlayers.length === 0) {
     return (
@@ -120,7 +123,7 @@ export function PlayerTable({ players, sofascoreData, marketType, aliasVersion }
             <PlayerRow
               key={`${player.player}-${idx}`}
               player={player}
-              sofascoreData={sofascoreData}
+              sofascoreMatch={sofascoreMatch}
               marketType={marketType}
               aliasVersion={aliasVersion}
               defaultLine={bestLine}

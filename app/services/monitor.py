@@ -2,6 +2,7 @@ import asyncio
 import time
 import logging
 import json
+import os
 from app.database import AsyncSessionLocal
 from app.services.redis_client import get_redis
 from app.services.odds_updater import process_updates
@@ -13,6 +14,59 @@ from sqlalchemy import delete
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+SOFASCORE_PRECACHE_ENABLED = _env_flag("SOFASCORE_PRECACHE_ENABLED", True)
+SOFASCORE_PRECACHE_MAX_DATES = _env_positive_int("SOFASCORE_PRECACHE_MAX_DATES", 2)
+
+
+def _match_date_key(match_info: dict) -> str | None:
+    raw_date = str(match_info.get("date") or "")
+    if len(raw_date) >= 10:
+        return raw_date[:10]
+    return None
+
+
+def _precache_dates_from_matches(matches: list[dict]) -> list[str]:
+    dates = {
+        date_key
+        for match_obj in matches
+        if (date_key := _match_date_key(match_obj.get("match", {})))
+    }
+    return sorted(dates)[:SOFASCORE_PRECACHE_MAX_DATES]
+
+
+async def precache_sofascore_dates(dates: list[str]) -> None:
+    if not SOFASCORE_PRECACHE_ENABLED or not dates:
+        return
+
+    from app.services.sofascore import get_sofascore_extraction
+
+    logger.info("Pre-caching SofaScore extraction for %s date(s): %s", len(dates), ", ".join(dates))
+    for date in dates:
+        try:
+            async with AsyncSessionLocal() as db:
+                await get_sofascore_extraction(date, db)
+            logger.info("Pre-cached SofaScore extraction for %s", date)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Failed to pre-cache SofaScore extraction for %s: %s", date, e)
 
 async def initialize_baseline(redis_client, db):
     # This imports the existing parser to get the initial state
@@ -107,13 +161,18 @@ async def initialize_baseline(redis_client, db):
                     
     await db.commit()
     logger.info("Baseline data initialized successfully.")
+    return _precache_dates_from_matches(matches)
 
 async def monitor_loop():
     logger.info("Starting Odds Monitor Loop...")
     redis_client = await get_redis()
+    precache_task = None
     
     async with AsyncSessionLocal() as db:
-        await initialize_baseline(redis_client, db)
+        precache_dates = await initialize_baseline(redis_client, db)
+
+    if SOFASCORE_PRECACHE_ENABLED and precache_dates:
+        precache_task = asyncio.create_task(precache_sofascore_dates(precache_dates))
     
     # 60 seconds max for since parameter to prevent clock drift 400 errors (API strictly limits to 90s)
     since = int(time.time()) - 60
@@ -146,6 +205,12 @@ async def monitor_loop():
             else:
                 pass
         except asyncio.CancelledError:
+            if precache_task:
+                precache_task.cancel()
+                try:
+                    await precache_task
+                except asyncio.CancelledError:
+                    pass
             logger.info("Monitor loop cancelled.")
             break
         except Exception as e:
