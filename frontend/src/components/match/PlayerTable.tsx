@@ -89,6 +89,9 @@ export function PlayerTable({ players, sofascoreMatch, marketType, aliasVersion 
             <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
               Line ▼
             </th>
+            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
+              Bet365 Odds
+            </th>
             {marketType === 'shots' && (
               <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
                 Shots/90
@@ -100,16 +103,10 @@ export function PlayerTable({ players, sofascoreMatch, marketType, aliasVersion 
               </th>
             )}
             <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
-              Bet365 Odds
-            </th>
-            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
               My Probability
             </th>
             <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
               EV ↓
-            </th>
-            <th scope="col" className="py-3 px-6 text-center text-xs font-medium text-text-muted uppercase tracking-wider">
-              True Edge
             </th>
           </tr>
         </thead>

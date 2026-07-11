@@ -36,11 +36,6 @@ export interface EdgeResult {
   probability: number;
   expectedReturn: number;
   evAtBookOdds: number;
-  edgeVsFairOdds: number;
-  bookImpliedProbability: number;
-  fairMarketProbability: number;
-  fairMarketOdds: number;
-  modelFairOdds: number;
 }
 
 /**
@@ -53,8 +48,7 @@ export interface EdgeResult {
 export function calculateEdgeData(
   lineStr: string, 
   odds: number | undefined, 
-  lambda: number | undefined,
-  bookmakerMargin: number = 0.06
+  lambda: number | undefined
 ): EdgeResult | null {
   if (odds === undefined || lambda === undefined || isNaN(odds) || isNaN(lambda) || lambda === 0) {
     return null;
@@ -74,26 +68,12 @@ export function calculateEdgeData(
   // 4. Expected Return = Probability * Odds
   const expectedReturn = probability * odds;
 
-  // 5. Convert the bookmaker odds into fair odds
-  const bookImpliedProbability = 1 / odds;
-  const fairMarketProbability = bookImpliedProbability / (1 + bookmakerMargin);
-  const fairMarketOdds = 1 / fairMarketProbability;
-
-  // 6. Calculate model fair odds
-  const modelFairOdds = probability > 0 ? 1 / probability : 0;
-
-  // 7. Calculate edges
+  // 5. Calculate EV at the current bookmaker odds.
   const evAtBookOdds = expectedReturn - 1;
-  const edgeVsFairOdds = modelFairOdds > 0 ? (fairMarketOdds / modelFairOdds) - 1 : 0;
 
   return {
     probability,
     expectedReturn,
-    evAtBookOdds,
-    edgeVsFairOdds,
-    bookImpliedProbability,
-    fairMarketProbability,
-    fairMarketOdds,
-    modelFairOdds
+    evAtBookOdds
   };
 }

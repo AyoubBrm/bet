@@ -11,6 +11,15 @@ interface PlayerRowProps {
   defaultLine?: string;
 }
 
+function getEdgeColorClass(value: number): string {
+  const percentage = value * 100;
+  if (percentage >= 30) return "text-emerald-400";
+  if (percentage >= 20) return "text-lime-400";
+  if (percentage >= 10) return "text-yellow-300";
+  if (percentage >= 0) return "text-orange-400";
+  return "text-red-400";
+}
+
 export function PlayerRow({ player, sofascoreMatch, marketType, aliasVersion, defaultLine }: PlayerRowProps) {
   // Extract all available shot lines (e.g., "shot +1", "shot +2")
   // Sort them numerically so +1 comes before +2, +10, etc.
@@ -37,6 +46,11 @@ export function PlayerRow({ player, sofascoreMatch, marketType, aliasVersion, de
   // Format numeric odds
   const cleanOdds = currentOdds !== undefined ? currentOdds.toFixed(2) : "N/A";
 
+  const formatLineLabel = (line: string): string => {
+    const num = parseInt(line.replace(/\D/g, ""), 10);
+    return isNaN(num) ? line : `Over ${num - 0.5}`;
+  };
+
   // Find the player in Sofascore data
   const sofaStats = useMemo(() => {
     if (!sofascoreMatch) return null;
@@ -60,52 +74,50 @@ export function PlayerRow({ player, sofascoreMatch, marketType, aliasVersion, de
 
   return (
     <tr className="hover:bg-surface-hover/50 transition-colors border-b border-border/50 last:border-0 group">
-      <td className="py-4 px-6 text-sm font-medium text-text whitespace-nowrap">
+      <td className="py-4 px-6 text-base font-semibold text-text whitespace-nowrap">
         {player.player}
       </td>
       <td className="py-4 px-6 whitespace-nowrap text-center">
-        <div className="relative w-32 mx-auto">
+        <div className="relative w-[98px] mx-auto">
           <select
             value={selectedShot}
             onChange={(e) => setSelectedShot(e.target.value)}
-            className="appearance-none bg-surface border border-border text-sm font-semibold rounded-lg focus:ring-primary focus:border-primary block w-full py-2.5 cursor-pointer transition-colors hover:border-primary/50 text-center"
+            className="appearance-none bg-surface border border-border text-sm font-bold rounded-md focus:ring-primary focus:border-primary block w-full h-9 pl-2 pr-6 cursor-pointer transition-colors hover:border-primary/50 text-center tabular-nums"
             style={{ textAlignLast: "center" }}
           >
             {shotOptions.map((opt) => {
-              const num = parseInt(opt.replace(/\D/g, ""), 10);
-              const over = isNaN(num) ? opt : `Over ${num - 0.5}`;
               return (
                 <option key={opt} value={opt} style={{ textAlign: "center" }}>
-                  {over}
+                  {formatLineLabel(opt)}
                 </option>
               );
             })}
           </select>
-          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-text">
-            <svg className="w-4 h-4 fill-current" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5 text-text">
+            <svg className="w-3.5 h-3.5 fill-current" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
               <path d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" />
             </svg>
           </div>
         </div>
       </td>
+      <td className="py-4 px-6 whitespace-nowrap text-center">
+        <span className={`inline-flex min-w-16 items-center justify-center px-3 py-1.5 rounded-md text-base font-bold tabular-nums ${cleanOdds !== 'N/A' ? 'bg-primary/10 text-primary border border-primary/20' : 'bg-surface text-text-muted border border-border'}`}>
+          {cleanOdds}
+        </span>
+      </td>
       {marketType === 'shots' && (
         <td className="py-4 px-6 whitespace-nowrap text-center">
-          <span className="text-sm font-medium text-text">{sofaStats ? sofaStats.shots_per_90_minutes : "--"}</span>
+          <span className="text-base font-bold tabular-nums text-text">{sofaStats ? sofaStats.shots_per_90_minutes : "--"}</span>
         </td>
       )}
       {marketType === 'tackles' && (
         <td className="py-4 px-6 whitespace-nowrap text-center">
-          <span className="text-sm font-medium text-text">{sofaStats ? sofaStats.tackles_per_90_minutes : "--"}</span>
+          <span className="text-base font-bold tabular-nums text-text">{sofaStats ? sofaStats.tackles_per_90_minutes : "--"}</span>
         </td>
       )}
       <td className="py-4 px-6 whitespace-nowrap text-center">
-        <span className={`inline-flex items-center justify-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cleanOdds !== 'N/A' ? 'bg-primary/10 text-primary border border-primary/20' : 'bg-surface text-text-muted border border-border'}`}>
-          {cleanOdds}
-        </span>
-      </td>
-      <td className="py-4 px-6 whitespace-nowrap text-center">
         {edgeData ? (
-          <span className="text-sm font-medium text-text">
+          <span className="text-base font-bold tabular-nums text-text">
             {(edgeData.probability * 100).toFixed(1)}%
           </span>
         ) : (
@@ -114,17 +126,8 @@ export function PlayerRow({ player, sofascoreMatch, marketType, aliasVersion, de
       </td>
       <td className="py-4 px-6 whitespace-nowrap text-center">
         {edgeData ? (
-          <span className={`text-sm font-medium ${edgeData.evAtBookOdds > 0 ? 'text-primary' : 'text-text-muted'}`}>
+          <span className={`text-base font-bold tabular-nums ${getEdgeColorClass(edgeData.evAtBookOdds)}`}>
             {edgeData.evAtBookOdds > 0 ? '+' : ''}{(edgeData.evAtBookOdds * 100).toFixed(1)}%
-          </span>
-        ) : (
-          <span className="text-text-muted text-sm opacity-50 group-hover:opacity-100 transition-opacity">--</span>
-        )}
-      </td>
-      <td className="py-4 px-6 whitespace-nowrap text-center">
-        {edgeData ? (
-          <span className={`text-sm font-bold ${edgeData.edgeVsFairOdds > 0 ? 'text-primary' : 'text-text-muted'}`}>
-            {edgeData.edgeVsFairOdds > 0 ? '+' : ''}{(edgeData.edgeVsFairOdds * 100).toFixed(1)}%
           </span>
         ) : (
           <span className="text-text-muted text-sm opacity-50 group-hover:opacity-100 transition-opacity">--</span>
