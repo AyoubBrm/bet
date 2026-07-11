@@ -2,8 +2,9 @@ import { useState, useEffect, useMemo } from "react";
 import { Header } from "./components/layout/Header";
 import { MatchCard } from "./components/match/MatchCard";
 import { Skeleton } from "./components/ui/Skeleton";
-import type { ApiResponse, MatchEntry, MatchJobStatus, SofascoreMatch, SofascoreResponse } from "./types/api";
+import type { ApiResponse, MatchEntry, MatchJobStatus, Player, SofascoreMatch, SofascoreResponse } from "./types/api";
 import { normalizeName } from "./lib/string-matching";
+import { isSofascorePlayerForBet365 } from "./lib/sofascore-player-match";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8002";
 type MarketKey = "shots" | "tackles";
@@ -13,6 +14,11 @@ interface MarketSnapshot {
   sofascoreData: SofascoreResponse | null;
   matchStatuses: Record<number, MatchJobStatus>;
   streamComplete: boolean;
+}
+
+interface StreamMatchTarget {
+  entry: MatchEntry;
+  playerNames: string[];
 }
 
 function getMarketEndpoint(market: MarketKey): string {
@@ -60,6 +66,35 @@ function buildSofascoreResponse(matches: SofascoreMatch[]): SofascoreResponse {
     ),
     matches: sortedMatches,
   };
+}
+
+function getEntryPlayers(entry: MatchEntry): Player[] {
+  return entry.player_shots ?? entry.player_tackles ?? [];
+}
+
+function uniquePlayerNames(players: Player[]): string[] {
+  return Array.from(new Set(players.map((player) => player.player).filter(Boolean)));
+}
+
+function sofaPlayerHasStats(player: SofascoreMatch["players"][number]): boolean {
+  return Boolean(player.matchs?.[0]?.statistics);
+}
+
+function sofaPlayerIsTerminal(player: SofascoreMatch["players"][number]): boolean {
+  return String(player.history_status ?? "") === "no_history";
+}
+
+function hasResolvedSofascorePlayer(
+  bet365PlayerName: string,
+  sofascoreMatch: SofascoreMatch
+): boolean {
+  const sofaPlayer = sofascoreMatch.players.find((player) =>
+    isSofascorePlayerForBet365(bet365PlayerName, player)
+  );
+  if (!sofaPlayer) return false;
+
+  // "no_history" is a resolved empty state. "timeout" is not: retry it on a later poll.
+  return sofaPlayerHasStats(sofaPlayer) || sofaPlayerIsTerminal(sofaPlayer);
 }
 
 function normalizeTeamName(name: string): string {
@@ -134,6 +169,51 @@ function findSofascoreMatch(
   });
 
   return candidates[0];
+}
+
+function getMissingSofascorePlayerNames(
+  entry: MatchEntry,
+  sofascoreData: SofascoreResponse | null
+): string[] {
+  const players = getEntryPlayers(entry);
+  if (players.length === 0) return [];
+
+  const sofascoreMatch = findSofascoreMatch(entry, sofascoreData);
+  if (!sofascoreMatch) {
+    return uniquePlayerNames(players);
+  }
+
+  return uniquePlayerNames(
+    players.filter((player) => !hasResolvedSofascorePlayer(player.player, sofascoreMatch))
+  );
+}
+
+function mergeSofascorePlayers(
+  existingPlayers: SofascoreMatch["players"],
+  incomingPlayers: SofascoreMatch["players"]
+): SofascoreMatch["players"] {
+  const merged = [...existingPlayers];
+
+  for (const incomingPlayer of incomingPlayers) {
+    const index = merged.findIndex((currentPlayer) => currentPlayer.player_id === incomingPlayer.player_id);
+    if (index === -1) {
+      merged.push(incomingPlayer);
+      continue;
+    }
+    const existingPlayer = merged[index];
+    const incomingHasStats = sofaPlayerHasStats(incomingPlayer);
+    const existingHasStats = sofaPlayerHasStats(existingPlayer);
+    const shouldKeepExistingStats = existingHasStats && !incomingHasStats;
+
+    merged[index] = {
+      ...existingPlayer,
+      ...incomingPlayer,
+      matchs: shouldKeepExistingStats ? existingPlayer.matchs : incomingPlayer.matchs ?? existingPlayer.matchs,
+      history_status: shouldKeepExistingStats ? existingPlayer.history_status : incomingPlayer.history_status,
+    };
+  }
+
+  return merged;
 }
 
 function App() {
@@ -216,16 +296,17 @@ function App() {
       );
     };
 
-    const getMatchesMissingSofascore = (matches: MatchEntry[]): MatchEntry[] => {
+    const getSofascoreStreamTargets = (matches: MatchEntry[]): StreamMatchTarget[] => {
       const currentSofascore = currentSnapshot?.sofascoreData;
-      if (!currentSofascore || currentSofascore.matches.length === 0) {
-        return matches.filter((entry) => currentSnapshot?.matchStatuses?.[entry.match.id] !== "failed");
-      }
 
-      return matches.filter((entry) => {
+      return matches.flatMap((entry) => {
         const status = currentSnapshot?.matchStatuses?.[entry.match.id];
-        if (status === "failed") return false;
-        return !findSofascoreMatch(entry, currentSofascore);
+        if (status === "failed") return [];
+
+        const playerNames = getMissingSofascorePlayerNames(entry, currentSofascore ?? null);
+        if (playerNames.length === 0) return [];
+
+        return [{ entry, playerNames }];
       });
     };
 
@@ -275,7 +356,7 @@ function App() {
     };
 
     const streamSofascoreMatches = async (
-      sortedMatches: MatchEntry[],
+      targets: StreamMatchTarget[],
       matchesById: Map<number, SofascoreMatch>
     ): Promise<void> => {
       const response = await fetch(`${API_BASE_URL}/api/extraction/stream/matches`, {
@@ -284,14 +365,12 @@ function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          matches: sortedMatches.map((entry) => ({
+          matches: targets.map(({ entry, playerNames }) => ({
             id: entry.match.id,
             home: entry.match.home,
             away: entry.match.away,
             date: entry.match.date,
-            players: Array.from(
-              new Set((entry.player_shots ?? entry.player_tackles ?? []).map((player) => player.player).filter(Boolean))
-            ),
+            players: playerNames,
           })),
         }),
         signal: controller.signal,
@@ -330,15 +409,15 @@ function App() {
 
         const findMatchedEntry = (matchPayload: Partial<SofascoreMatch>) => {
           if (matchPayload.bet365_event_id) {
-            return sortedMatches.find((entry) => String(entry.match.id) === String(matchPayload.bet365_event_id));
+            return targets.find(({ entry }) => String(entry.match.id) === String(matchPayload.bet365_event_id))?.entry;
           }
           if (!matchPayload.match_id || !matchPayload.teams) {
             return undefined;
           }
-          return sortedMatches.find((entry) => findSofascoreMatch(
+          return targets.find(({ entry }) => findSofascoreMatch(
                 entry,
                 buildSofascoreResponse([matchPayload as SofascoreMatch])
-              ));
+              ))?.entry;
         };
 
         const markMatchStatus = (matchPayload: Partial<SofascoreMatch>, status: MatchJobStatus) => {
@@ -357,7 +436,7 @@ function App() {
           matchesById.set(matchPayload.match_id, {
             ...existing,
             ...matchPayload,
-            players: matchPayload.players ?? existing?.players ?? [],
+            players: mergeSofascorePlayers(existing?.players ?? [], matchPayload.players ?? []),
           });
           publishMatches();
         };
@@ -391,17 +470,10 @@ function App() {
             players: [],
           };
 
-          const playerExists = existing.players.some((currentPlayer) => currentPlayer.player_id === player.player_id);
-          const updatedPlayers = playerExists
-            ? existing.players.map((currentPlayer) =>
-                currentPlayer.player_id === player.player_id ? player : currentPlayer
-              )
-            : [...existing.players, player];
-
           matchesById.set(matchId, {
             ...existing,
             bet365_event_id: playerPayload.bet365_event_id ?? existing.bet365_event_id,
-            players: updatedPlayers,
+            players: mergeSofascorePlayers(existing.players, [player]),
           });
           markMatchStatus(matchesById.get(matchId) ?? existing, "calculating");
           publishMatches();
@@ -489,16 +561,20 @@ function App() {
           void prefetchMarketData(getOppositeMarket(activeMarket));
         }
         
+        if (streamActive) {
+          return;
+        }
+
         // Stream only matches missing SofaScore data. Odds-only updates stay frontend-only.
-        const missingMatches = getMatchesMissingSofascore(sortedResult.matches ?? []);
-        if (missingMatches.length > 0) {
+        const streamTargets = getSofascoreStreamTargets(sortedResult.matches ?? []);
+        if (streamTargets.length > 0) {
           const matchesById = new Map<number, SofascoreMatch>(
             (currentSnapshot?.sofascoreData?.matches ?? []).map((match) => [match.match_id, match])
           );
           if (cancelled) return;
           streamActive = true;
           try {
-            await streamSofascoreMatches(missingMatches, matchesById);
+            await streamSofascoreMatches(streamTargets, matchesById);
             if (!cancelled) {
               saveMarketSnapshot({ streamComplete: true });
             }
@@ -516,11 +592,10 @@ function App() {
     // Fetch immediately. Cached markets render first and refresh silently.
     fetchData(!hasSnapshotAtStart);
 
-    // Set up silent background polling every 5 seconds
+    // Set up silent background polling every 5 seconds.
+    // Keep odds fresh during SofaScore streaming; fetchData prevents duplicate streams.
     intervalId = setInterval(() => {
-      if (!streamActive) {
-        fetchData(false);
-      }
+      fetchData(false);
     }, 5000);
     
     return () => {
