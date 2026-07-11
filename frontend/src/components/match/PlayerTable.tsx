@@ -4,10 +4,6 @@ import { PlayerRow } from "./PlayerRow";
 import { isSofascorePlayerForBet365 } from "../../lib/sofascore-player-match";
 import { calculateEdgeData } from "../../lib/math";
 
-// Odds range considered "close to 2.0"
-const ODDS_MIN = 1.65;
-const ODDS_MAX = 2.50;
-
 interface PlayerTableProps {
   players: Player[];
   sofascoreMatch: SofascoreMatch | null;
@@ -52,8 +48,7 @@ export function PlayerTable({ players, sofascoreMatch, marketType, aliasVersion 
     const mappedPlayers = players
       .map((player, index) => {
         const best = getBestLine(player);
-        // Only keep players whose best line is "close to 2.0"
-        if (!best || best.odds < ODDS_MIN || best.odds > ODDS_MAX) return null;
+        if (!best) return null;
 
         const sofaStats = getSofaStats(player, sofascoreMatch);
         const lambda =
@@ -78,7 +73,7 @@ export function PlayerTable({ players, sofascoreMatch, marketType, aliasVersion 
   if (enrichedPlayers.length === 0) {
     return (
       <div className="p-8 text-center text-text-muted text-sm">
-        No players found with odds between {ODDS_MIN} – {ODDS_MAX} for this match.
+        No player odds found for this match.
       </div>
     );
   }
