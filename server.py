@@ -16,11 +16,18 @@ from datetime import datetime, timezone
 
 from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import Base, engine, get_db
+from app.database import AsyncSessionLocal, Base, engine, get_db
+from app.models.sofascore import PlayerHistory
 from app.services.monitor import monitor_loop
-from app.services.sofascore import ascii_fold, get_sofascore_extraction, sofascore_service
+from app.services.sofascore import (
+    ascii_fold,
+    get_sofascore_extraction,
+    history_date_from_timestamp,
+    sofascore_service,
+)
 
 # ─────────────────────────────────────────────────────────────────────
 # Logging
@@ -39,6 +46,41 @@ monitor_task = None
 sync_task = None
 sofascore_warmup_task = None
 
+
+async def backfill_player_history_dates() -> int:
+    """Add a readable UTC date to legacy PlayerHistory JSON records once."""
+    updated_players = 0
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(PlayerHistory))
+        for player_history in result.scalars():
+            history = player_history.history
+            if not isinstance(history, list):
+                continue
+
+            changed = False
+            updated_history = []
+            for item in history:
+                if not isinstance(item, dict):
+                    updated_history.append(item)
+                    continue
+
+                updated_item = dict(item)
+                if not updated_item.get("date"):
+                    date = history_date_from_timestamp(updated_item.get("startTimestamp"))
+                    if date:
+                        updated_item["date"] = date
+                        changed = True
+                updated_history.append(updated_item)
+
+            if changed:
+                player_history.history = updated_history
+                updated_players += 1
+
+        if updated_players:
+            await db.commit()
+
+    return updated_players
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global monitor_task, sync_task, sofascore_warmup_task
@@ -48,6 +90,22 @@ async def lifespan(app: FastAPI):
         try:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(text(
+                    "ALTER TABLE bet365_sofascore_mapping "
+                    "ADD COLUMN IF NOT EXISTS raw_event_data JSON"
+                ))
+                for index_statement in (
+                    "CREATE INDEX IF NOT EXISTS ix_players_event_id ON players (event_id)",
+                    "CREATE INDEX IF NOT EXISTS ix_player_shot_odds_player_id ON player_shot_odds (player_id)",
+                    "CREATE INDEX IF NOT EXISTS ix_player_tackle_odds_player_id ON player_tackle_odds (player_id)",
+                ):
+                    await conn.execute(text(index_statement))
+            updated_player_histories = await backfill_player_history_dates()
+            if updated_player_histories:
+                logger.info(
+                    "Added UTC date fields to %s legacy PlayerHistory record(s).",
+                    updated_player_histories,
+                )
             break
         except Exception as e:
             if i == max_retries - 1:
@@ -594,6 +652,26 @@ async def stream_matches_pipeline(payload: dict = Body(...)):
             str(event.get("awayTeam", {}).get("name") or ""),
         )
 
+    def is_raw_sofascore_event(event: dict | None) -> bool:
+        if not isinstance(event, dict):
+            return False
+        return bool(
+            event.get("id")
+            and event.get("homeTeam", {}).get("id")
+            and event.get("awayTeam", {}).get("id")
+            and event.get("startTimestamp")
+        )
+
+    def mapping_live_event(mapping: Bet365SofascoreMapping) -> dict | None:
+        if is_raw_sofascore_event(mapping.raw_event_data):
+            return mapping.raw_event_data
+        if is_raw_sofascore_event(mapping.event_data):
+            return mapping.event_data
+        return None
+
+    def mapping_event_data(raw_event: dict | None, fallback: dict) -> dict:
+        return raw_event if is_raw_sofascore_event(raw_event) else fallback
+
     def same_teams(target: dict, event: dict) -> bool:
         target_home = normalize_team(target.get("home", ""))
         target_away = normalize_team(target.get("away", ""))
@@ -808,12 +886,22 @@ async def stream_matches_pipeline(payload: dict = Body(...)):
                             cached_payloads.append(cached_match_data)
                             continue
 
+                        raw_event = mapping_live_event(mapping)
+                        if not raw_event:
+                            logger.warning(
+                                "[STREAM] Mapping %s -> %s has no valid raw SofaScore event; re-resolving.",
+                                bet365_id,
+                                mapping.sofascore_event_id,
+                            )
+                            unresolved_targets.append(target)
+                            continue
+
                         live_items.append({
                             "bet365_event_id": bet365_id,
                             "date": mapping.date,
                             "player_names": target.get("players") or [],
                             "sort_time": (mapping.start_timestamp or 0) * 1000 or target_time(target),
-                            "event": mapping.event_data,
+                            "event": raw_event,
                         })
 
                     cache_entry = None
@@ -860,6 +948,7 @@ async def stream_matches_pipeline(payload: dict = Body(...)):
                                 start_timestamp=candidate.get("startTimestamp"),
                                 sync_status="pending",
                                 event_data=candidate,
+                                raw_event_data=None,
                             ))
                     if mappings_to_save:
                         async with AsyncSessionLocal() as db:
@@ -915,7 +1004,8 @@ async def stream_matches_pipeline(payload: dict = Body(...)):
                             away=target.get("away"),
                             start_timestamp=candidate.get("startTimestamp"),
                             sync_status="pending",
-                            event_data=candidate,
+                            event_data=mapping_event_data(candidate, candidate),
+                            raw_event_data=candidate,
                         ))
                         cache_checks.append((target, candidate, bet365_id, sofa_id))
 
@@ -963,7 +1053,7 @@ async def stream_matches_pipeline(payload: dict = Body(...)):
 
                 cached_payloads.sort(key=lambda match: (event_time(match), match.get("teams", "")))
                 for match_data in cached_payloads:
-                    yield f"data: {json.dumps({'type': 'status', 'status': 'cached', 'match_id': match_data.get('match_id')})}\n\n"
+                    yield f"data: {json.dumps({'type': 'status', 'status': 'cached', 'match_id': match_data.get('match_id'), 'bet365_event_id': match_data.get('bet365_event_id')})}\n\n"
                     yield f"data: {json.dumps({'type': 'match', 'data': match_data})}\n\n"
 
                 live_items.sort(key=lambda item: item["sort_time"])

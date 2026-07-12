@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY server.py .
 COPY app/ ./app/
+COPY migrations/ ./migrations/
+COPY alembic.ini .
 
 # Expose the FastAPI port
 EXPOSE 8002

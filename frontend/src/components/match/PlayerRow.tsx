@@ -65,12 +65,15 @@ export function PlayerRow({ player, sofascoreMatch, marketType, aliasVersion, de
     return null;
   }, [player.player, sofascoreMatch, aliasVersion]);
 
-  // Run Edge Calculation
+  // Recalculate only when the selected line, live odds, or cached SofaScore rate changes.
   const lambda = marketType === 'shots' 
     ? sofaStats?.shots_per_90_minutes 
     : sofaStats?.tackles_per_90_minutes;
-    
-  const edgeData = calculateEdgeData(selectedShot, currentOdds, lambda);
+
+  const edgeData = useMemo(
+    () => calculateEdgeData(selectedShot, currentOdds, lambda),
+    [selectedShot, currentOdds, lambda]
+  );
 
   return (
     <tr className="hover:bg-surface-hover/50 transition-colors border-b border-border/50 last:border-0 group">

@@ -1,4 +1,9 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import re
+
+with open(r'c:\Users\bmayo\OneDrive\Desktop\SOFA\frontend\src\App.tsx', 'r', encoding='utf-8') as f:
+    original = f.read()
+
+imports_replacement = """import { useState, useEffect, useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Header } from "./components/layout/Header";
 import { MatchCard } from "./components/match/MatchCard";
@@ -13,199 +18,11 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8002
 interface StreamMatchTarget {
   entry: MatchEntry;
   playerNames: string[];
-}
+}"""
 
-function getMarketEndpoint(market: MarketKey): string {
-  return `${API_BASE_URL}/upcoming/player_${market}`;
-}
+original = re.sub(r'import \{ useState, useEffect, useMemo \} from "react";.*?interface StreamMatchTarget \{\n  entry: MatchEntry;\n  playerNames: string\[\];\n\}', imports_replacement, original, flags=re.DOTALL)
 
-
-function getMatchTime(entry: MatchEntry): number {
-  const timestamp = Date.parse(entry.match.date);
-  return Number.isFinite(timestamp) ? timestamp : 0;
-}
-
-function sortMatchEntries(matches: MatchEntry[]): MatchEntry[] {
-  return [...matches].sort((a, b) => {
-    const timeDiff = getMatchTime(a) - getMatchTime(b);
-    if (timeDiff !== 0) return timeDiff;
-    return a.match.id - b.match.id;
-  });
-}
-
-function getSofascoreTime(match: SofascoreMatch): number {
-  if (match.startTimestamp) return match.startTimestamp * 1000;
-  const timestamp = Date.parse(match.date ?? "");
-  return Number.isFinite(timestamp) ? timestamp : 0;
-}
-
-function sortSofascoreMatches(matches: SofascoreMatch[]): SofascoreMatch[] {
-  return [...matches].sort((a, b) => {
-    const timeDiff = getSofascoreTime(a) - getSofascoreTime(b);
-    if (timeDiff !== 0) return timeDiff;
-    return a.teams.localeCompare(b.teams);
-  });
-}
-
-function buildSofascoreResponse(matches: SofascoreMatch[]): SofascoreResponse {
-  const sortedMatches = sortSofascoreMatches(matches);
-  return {
-    match_count: sortedMatches.length,
-    total_number_of_player_s: sortedMatches.reduce(
-      (sum, match) => sum + (match["number_of_player's"] ?? match.number_of_player_s ?? 0),
-      0
-    ),
-    matches: sortedMatches,
-  };
-}
-
-function getEntryPlayers(entry: MatchEntry): Player[] {
-  return entry.player_shots ?? entry.player_tackles ?? [];
-}
-
-function uniquePlayerNames(players: Player[]): string[] {
-  return Array.from(new Set(players.map((player) => player.player).filter(Boolean)));
-}
-
-function sofaPlayerHasStats(player: SofascoreMatch["players"][number]): boolean {
-  return Boolean(player.matchs?.[0]?.statistics);
-}
-
-function sofaPlayerIsTerminal(player: SofascoreMatch["players"][number]): boolean {
-  return String(player.history_status ?? "") === "no_history";
-}
-
-function hasResolvedSofascorePlayer(
-  bet365PlayerName: string,
-  sofascoreMatch: SofascoreMatch
-): boolean {
-  const sofaPlayer = sofascoreMatch.players.find((player) =>
-    isSofascorePlayerForBet365(bet365PlayerName, player)
-  );
-  if (!sofaPlayer) return false;
-
-  return sofaPlayerHasStats(sofaPlayer) || sofaPlayerIsTerminal(sofaPlayer);
-}
-
-function normalizeTeamName(name: string): string {
-  return normalizeName(name)
-    .replace(/\b(fc|cf|sc|club)\b/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function getSofascoreTeams(match: SofascoreMatch): [string, string] {
-  if (match.home && match.away) {
-    return [match.home, match.away];
-  }
-  const parts = match.teams.split(" v ");
-  return [parts[0] ?? "", parts[1] ?? ""];
-}
-
-function sameMatchDay(entry: MatchEntry, match: SofascoreMatch): boolean {
-  const oddsDate = entry.match.date.split("T")[0];
-  const sofaDate = match.startTimestamp
-    ? new Date(match.startTimestamp * 1000).toISOString().split("T")[0]
-    : match.date?.split("T")[0];
-  return !sofaDate || oddsDate === sofaDate;
-}
-
-function getKickoffDistance(entry: MatchEntry, match: SofascoreMatch): number {
-  const oddsTime = getMatchTime(entry);
-  const sofaTime = getSofascoreTime(match);
-  if (!oddsTime || !sofaTime) return Number.MAX_SAFE_INTEGER;
-  return Math.abs(oddsTime - sofaTime);
-}
-
-function findSofascoreMatch(
-  entry: MatchEntry,
-  sofascoreData: SofascoreResponse | null
-): SofascoreMatch | null {
-  if (!sofascoreData) return null;
-
-  const directMatch = sofascoreData.matches.find(
-    (match) => String(match.bet365_event_id ?? "") === String(entry.match.id)
-  );
-  if (directMatch) return directMatch;
-
-  const home = normalizeTeamName(entry.match.home);
-  const away = normalizeTeamName(entry.match.away);
-  const candidates: SofascoreMatch[] = [];
-
-  for (const match of sofascoreData.matches) {
-    const [sofaHomeRaw, sofaAwayRaw] = getSofascoreTeams(match);
-    const sofaHome = normalizeTeamName(sofaHomeRaw);
-    const sofaAway = normalizeTeamName(sofaAwayRaw);
-    const sameTeams =
-      (home === sofaHome && away === sofaAway) ||
-      (home === sofaAway && away === sofaHome);
-
-    if (!sameTeams) continue;
-    candidates.push(match);
-  }
-
-  if (candidates.length === 0) return null;
-
-  candidates.sort((a, b) => {
-    const dayDiff = Number(!sameMatchDay(entry, a)) - Number(!sameMatchDay(entry, b));
-    if (dayDiff !== 0) return dayDiff;
-
-    const timeDiff = getKickoffDistance(entry, a) - getKickoffDistance(entry, b);
-    if (timeDiff !== 0) return timeDiff;
-
-    return a.teams.localeCompare(b.teams);
-  });
-
-  return candidates[0];
-}
-
-function getMissingSofascorePlayerNames(
-  entry: MatchEntry,
-  sofascoreData: SofascoreResponse | null
-): string[] {
-  const players = getEntryPlayers(entry);
-  if (players.length === 0) return [];
-
-  const sofascoreMatch = findSofascoreMatch(entry, sofascoreData);
-  if (!sofascoreMatch) {
-    return uniquePlayerNames(players);
-  }
-
-  return uniquePlayerNames(
-    players.filter((player) => !hasResolvedSofascorePlayer(player.player, sofascoreMatch))
-  );
-}
-
-function mergeSofascorePlayers(
-  existingPlayers: SofascoreMatch["players"],
-  incomingPlayers: SofascoreMatch["players"]
-): SofascoreMatch["players"] {
-  const merged = [...existingPlayers];
-
-  for (const incomingPlayer of incomingPlayers) {
-    const index = merged.findIndex((currentPlayer) => currentPlayer.player_id === incomingPlayer.player_id);
-    if (index === -1) {
-      merged.push(incomingPlayer);
-      continue;
-    }
-    const existingPlayer = merged[index];
-    const incomingHasStats = sofaPlayerHasStats(incomingPlayer);
-    const existingHasStats = sofaPlayerHasStats(existingPlayer);
-    const shouldKeepExistingStats = existingHasStats && !incomingHasStats;
-
-    merged[index] = {
-      ...existingPlayer,
-      ...incomingPlayer,
-      matchs: shouldKeepExistingStats ? existingPlayer.matchs : incomingPlayer.matchs ?? existingPlayer.matchs,
-      history_status: shouldKeepExistingStats ? existingPlayer.history_status : incomingPlayer.history_status,
-    };
-  }
-
-  return merged;
-}
-
-function App() {
+app_replacement = """function App() {
   const [activeMarket, setActiveMarket] = useState<MarketKey | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [aliasVersion, setAliasVersion] = useState(0);
@@ -313,7 +130,7 @@ function App() {
         let buffer = "";
 
         const handleEvent = (rawEvent: string) => {
-          const evtData = rawEvent.split("\n").filter((l: string) => l.startsWith("data:")).map((l: string) => l.slice(5).trimStart()).join("\n").trim();
+          const evtData = rawEvent.split("\\n").filter((l: string) => l.startsWith("data:")).map((l: string) => l.slice(5).trimStart()).join("\\n").trim();
           if (!evtData) return;
 
           const payload = JSON.parse(evtData);
@@ -395,12 +212,12 @@ function App() {
 
         while (true) {
           const { value, done } = await reader.read();
-          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done }).replace(/\r\n/g, "\n");
-          let eventEnd = buffer.indexOf("\n\n");
+          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done }).replace(/\\r\\n/g, "\\n");
+          let eventEnd = buffer.indexOf("\\n\\n");
           while (eventEnd !== -1) {
             handleEvent(buffer.slice(0, eventEnd));
             buffer = buffer.slice(eventEnd + 2);
-            eventEnd = buffer.indexOf("\n\n");
+            eventEnd = buffer.indexOf("\\n\\n");
           }
           if (done) break;
         }
@@ -512,4 +329,11 @@ function App() {
   );
 }
 
-export default App;
+export default App;"""
+
+original = re.sub(r'function App\(\) \{.*', app_replacement, original, flags=re.DOTALL)
+
+with open(r'c:\Users\bmayo\OneDrive\Desktop\SOFA\frontend\src\App.tsx', 'w', encoding='utf-8') as f:
+    f.write(original)
+
+print('Done')

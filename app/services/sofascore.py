@@ -4,6 +4,7 @@ import os
 import random
 import time
 import unicodedata
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 import httpx
@@ -80,6 +81,16 @@ _API_HEADERS = {
 }
 
 logger = logging.getLogger("sofascore_extractor")
+
+
+def history_date_from_timestamp(start_timestamp: Any) -> Optional[str]:
+    """Return the UTC calendar date stored alongside a SofaScore timestamp."""
+    if not start_timestamp:
+        return None
+    try:
+        return datetime.fromtimestamp(int(start_timestamp), timezone.utc).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 _ASCII_TRANSLITERATION = str.maketrans({
     "\u00f8": "o",
@@ -458,7 +469,7 @@ class DataExtractionService:
             except Exception as e:
                 return default_return
 
-    async def _fetch_player_stat_for_history(self, player_id: int, match_id: int) -> Optional[Dict[str, Any]]:
+    async def _fetch_player_stat_for_history(self, player_id: int, match_id: int, start_timestamp: Optional[int] = None) -> Optional[Dict[str, Any]]:
         stats_data = await self._safe_api_call(self._sofascore.get_event_player_statistics(match_id, player_id), {})
         if not stats_data or "statistics" not in stats_data:
             return None
@@ -470,6 +481,9 @@ class DataExtractionService:
 
         return {
             "played": True,
+            "match_id": match_id,
+            "startTimestamp": start_timestamp,
+            "date": history_date_from_timestamp(start_timestamp),
             "statistics": {
                 "totalTackle": raw_stats.get("totalTackle", 0),
                 "totalShots": raw_stats.get("totalShots", 0),
@@ -489,23 +503,24 @@ class DataExtractionService:
                 break
 
             page_data = await self._safe_api_call(self._sofascore.get_player_events(player_id, page), {})
-            page_event_ids = []
+            page_event_info = []
             for event in page_data.get("events", []):
                 event_id = event.get("id")
+                start_ts = event.get("startTimestamp")
                 if not event_id or event_id in seen_event_ids:
                     continue
                 seen_event_ids.add(event_id)
-                page_event_ids.append(event_id)
+                page_event_info.append((event_id, start_ts))
 
-            if not page_event_ids:
+            if not page_event_info:
                 break
 
             remaining_scan_slots = _PLAYER_HISTORY_MAX_EVENTS - scanned_event_count
-            page_event_ids = page_event_ids[:remaining_scan_slots]
-            scanned_event_count += len(page_event_ids)
+            page_event_info = page_event_info[:remaining_scan_slots]
+            scanned_event_count += len(page_event_info)
 
             stat_results = await asyncio.gather(
-                *(self._fetch_player_stat_for_history(player_id, event_id) for event_id in page_event_ids)
+                *(self._fetch_player_stat_for_history(player_id, event_id, start_ts) for event_id, start_ts in page_event_info)
             )
             for stat in stat_results:
                 if stat:
@@ -513,6 +528,7 @@ class DataExtractionService:
                     if len(valid_history) >= _PLAYER_HISTORY_TARGET_VALID:
                         break
 
+        valid_history.sort(key=lambda x: x.get("startTimestamp") or 0, reverse=True)
         return player_id, valid_history[:_PLAYER_HISTORY_TARGET_VALID]
 
     async def _fetch_valid_player_history_with_timeout(self, player_id: int) -> tuple[int, List[Dict[str, Any]]]:
@@ -1247,8 +1263,9 @@ class DataExtractionService:
                         players_to_sync.append(p_id)
                         
             # Fetch stats for each player
+            start_ts = match_info.get("startTimestamp")
             async def fetch_stats_for_sync(p_id: int):
-                return p_id, await self._fetch_player_stat_for_history(p_id, m_id)
+                return p_id, await self._fetch_player_stat_for_history(p_id, m_id, start_ts)
                 
             sync_results = await asyncio.gather(*[fetch_stats_for_sync(p_id) for p_id in players_to_sync])
             
@@ -1261,11 +1278,12 @@ class DataExtractionService:
                 result = await self.db.execute(stmt)
                 history_entry = result.scalars().first()
                 if history_entry:
-                    # Sliding window: remove oldest game, append new one, keep max 30
+                    # Insert new match at the beginning, sort by date just in case, keep max 30
                     current_history = list(history_entry.history)
-                    current_history.append(stats)
+                    current_history.insert(0, stats)
+                    current_history.sort(key=lambda x: x.get("startTimestamp") or 0, reverse=True)
                     if len(current_history) > _PLAYER_HISTORY_TARGET_VALID:
-                        current_history = current_history[-_PLAYER_HISTORY_TARGET_VALID:]
+                        current_history = current_history[:_PLAYER_HISTORY_TARGET_VALID]
                     history_entry.history = current_history
                     self.db.add(history_entry)
                 else:

@@ -63,11 +63,14 @@ export function PlayerTable({ players, sofascoreMatch, marketType, aliasVersion 
       })
       .filter((x): x is { player: Player; bestLine: string; ev: number; hasStats: boolean; index: number } => x !== null);
 
-    const allRowsHaveStats = mappedPlayers.length > 0 && mappedPlayers.every((entry) => entry.hasStats);
-    if (allRowsHaveStats) {
-      return [...mappedPlayers].sort((a, b) => b.ev - a.ev);
-    }
-    return mappedPlayers;
+    return [...mappedPlayers].sort((a, b) => {
+      // If one has stats and the other doesn't, put the one with stats higher
+      if (a.hasStats && !b.hasStats) return -1;
+      if (!a.hasStats && b.hasStats) return 1;
+      
+      // Otherwise, sort by EV descending
+      return b.ev - a.ev;
+    });
   }, [players, sofascoreMatch, marketType, aliasVersion]);
 
   if (enrichedPlayers.length === 0) {

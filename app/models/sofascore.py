@@ -45,5 +45,6 @@ class Bet365SofascoreMapping(Base):
     start_timestamp = Column(Integer, index=True, nullable=True)
     sync_status = Column(String, default="pending", index=True)
     event_data = Column(JSON, nullable=False)
+    raw_event_data = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
